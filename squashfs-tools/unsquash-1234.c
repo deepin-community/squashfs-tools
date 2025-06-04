@@ -25,8 +25,8 @@
  * unsquash-4.
  */
 
-#define TRUE 1
-#define FALSE 0
+#include "unsquashfs.h"
+
 /*
  * Check name for validity, name should not
  *  - be ".", "./", or
@@ -53,6 +53,43 @@ int check_name(char *name, int size)
 
 	if((name - start) != size)
 		return FALSE;
+
+	return TRUE;
+}
+
+
+void squashfs_closedir(struct dir *dir)
+{
+	struct dir_ent *ent = dir->dirs;
+
+	while(ent) {
+		struct dir_ent *tmp = ent;
+
+		ent = ent->next;
+		free(tmp->name);
+		free(tmp);
+	}
+
+	free(dir);
+}
+
+
+/*
+ * Check directory for duplicate names.  As the directory should be sorted,
+ * duplicates will be consecutive.  Obviously we also need to check if the
+ * directory has been deliberately unsorted, to evade this check.
+ */
+int check_directory(struct dir *dir)
+{
+	int i;
+	struct dir_ent *ent;
+
+	if(dir->dir_count < 2)
+		return TRUE;
+
+	for(ent = dir->dirs, i = 0; i < dir->dir_count - 1; ent = ent->next, i++)
+		if(strcmp(ent->name, ent->next->name) >= 0)
+			return FALSE;
 
 	return TRUE;
 }

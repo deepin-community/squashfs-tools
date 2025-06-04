@@ -4,7 +4,7 @@
  * Create a squashfs filesystem.  This is a highly compressed read only
  * filesystem.
  *
- * Copyright (c) 2009, 2010, 2014, 2017, 2021
+ * Copyright (c) 2009, 2010, 2014, 2017, 2021, 2022, 2023
  * Phillip Lougher <phillip@squashfs.org.uk>
  *
  * This program is free software; you can redistribute it and/or
@@ -46,6 +46,7 @@ struct pseudo_stat {
 struct pseudo_file {
 	char		*filename;
 	long long	start;
+	long long	current;
 	int		fd;
 };
 
@@ -53,6 +54,7 @@ struct pseudo_data {
 	struct pseudo_file	*file;
 	long long		offset;
 	long long		length;
+	int			sparse;
 };
 
 struct pseudo_dev {
@@ -75,6 +77,7 @@ struct pseudo_entry {
 	char			*pathname;
 	struct pseudo		*pseudo;
 	struct pseudo_dev	*dev;
+	struct pseudo_xattr	*xattr;
 };
 	
 struct pseudo {
@@ -82,6 +85,13 @@ struct pseudo {
 	int			count;
 	struct pseudo_entry	*name;
 };
+
+struct pseudo_xattr {
+	int			count;
+	struct xattr_add	*xattr;
+};
+
+extern struct pseudo *pseudo;
 
 extern long long read_bytes(int, void *, long long);
 extern int read_pseudo_definition(char *, char *);
@@ -92,4 +102,6 @@ extern struct pseudo_dev *get_pseudo_file(int);
 extern int pseudo_exec_file(struct pseudo_dev *, int *);
 extern struct pseudo *get_pseudo();
 extern void dump_pseudos();
+extern char *get_element(char *target, char **targname);
+extern void print_definitions();
 #endif

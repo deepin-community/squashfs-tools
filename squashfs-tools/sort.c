@@ -3,7 +3,7 @@
  * filesystem.
  *
  * Copyright (c) 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2009, 2010, 2012,
- * 2013, 2014, 2021
+ * 2013, 2014, 2021, 2022
  * Phillip Lougher <phillip@squashfs.org.uk>
  *
  * This program is free software; you can redistribute it and/or
@@ -44,7 +44,7 @@
 #include "mksquashfs_error.h"
 #include "progressbar.h"
 
-int mkisofs_style = -1;
+static int mkisofs_style = -1;
 
 struct sort_info {
 	dev_t			st_dev;
@@ -53,15 +53,15 @@ struct sort_info {
 	struct sort_info	*next;
 };
 
-struct sort_info *sort_info_list[65536];
+static struct sort_info *sort_info_list[65536];
 
 struct priority_entry *priority_list[65536];
 
 extern int silent;
 extern char *pathname(struct dir_ent *dir_ent);
+extern long long hardlnk_count;
 
-
-void add_priority_list(struct dir_ent *dir, int priority)
+static void add_priority_list(struct dir_ent *dir, int priority)
 {
 	struct priority_entry *new_priority_entry;
 
@@ -76,7 +76,7 @@ void add_priority_list(struct dir_ent *dir, int priority)
 }
 
 
-int get_priority(char *filename, struct stat *buf, int priority)
+static int get_priority(char *filename, struct stat *buf, int priority)
 {
 	int hash = buf->st_ino & 0xffff;
 	struct sort_info *s;
@@ -103,7 +103,7 @@ int get_priority(char *filename, struct stat *buf, int priority)
 	s->next = sort_info_list[hash];\
 	sort_info_list[hash] = s;\
 	}
-int add_sort_list(char *path, int priority, int source, char *source_path[])
+static int add_sort_list(char *path, int priority, int source, char *source_path[])
 {
 	int i, n;
 	struct stat buf;
@@ -363,6 +363,7 @@ void sort_files_and_write(struct dir_info *dir)
 					duplicate_file ? "DUPLICATE" : "");
 				entry->dir->inode->inode = inode;
 				entry->dir->inode->type = SQUASHFS_FILE_TYPE;
+				hardlnk_count --;
 			} else
 				INFO("file %s, uncompressed size %lld bytes "
 					"LINK\n", pathname(entry->dir),

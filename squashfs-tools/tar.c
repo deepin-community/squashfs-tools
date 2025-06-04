@@ -1,7 +1,7 @@
 /*
  * Squashfs
  *
- * Copyright (c) 2021
+ * Copyright (c) 2021, 2022
  * Phillip Lougher <phillip@squashfs.org.uk>
  *
  * This program is free software; you can redistribute it and/or
@@ -31,6 +31,7 @@
 #include <pwd.h>
 #include <grp.h>
 #include <time.h>
+#include <regex.h>
 
 #include "squashfs_fs.h"
 #include "mksquashfs.h"
@@ -45,8 +46,16 @@
 #define FALSE 0
 
 extern int silent;
+int ignore_zeros = FALSE;
+extern int ignore_zeros;
+int default_uid_opt = FALSE;
+unsigned int default_uid;
+int default_gid_opt = FALSE;
+unsigned int default_gid;
+int default_mode_opt = FALSE;
+mode_t default_mode;
 
-long long read_octal(char *s, int size)
+static long long read_octal(char *s, int size)
 {
 	long long res = 0;
 
@@ -65,7 +74,7 @@ long long read_octal(char *s, int size)
 }
 
 
-long long read_binary(char *src, int size)
+static long long read_binary(char *src, int size)
 {
 	unsigned char *s = (unsigned char *) src;
 	long long res = 0;
@@ -77,16 +86,16 @@ long long read_binary(char *src, int size)
 }
 
 
-long long read_number(char *s, int size)
+static long long read_number(char *s, int size)
 {
-	if(*s == -128)
+	if(*((signed char *) s) == -128)
 		return read_binary(s + 1, size - 1);
 	else
 		return read_octal(s, size);
 }
 
 
-long long read_decimal(char *s, int maxsize, int *bytes)
+static long long read_decimal(char *s, int maxsize, int *bytes)
 {
 	long long res = 0;
 	int size = maxsize;
@@ -108,7 +117,7 @@ long long read_decimal(char *s, int maxsize, int *bytes)
 }
 
 
-char *read_long_string(int size, int skip)
+static char *read_long_string(int size, int skip)
 {
 	char buffer[512];
 	char *name = malloc(size + 1);
@@ -121,8 +130,9 @@ char *read_long_string(int size, int skip)
 		int expected = size > 512 ? 512 : size;
 
 		res = read_bytes(STDIN_FILENO, buffer, 512);
-		if(res == FALSE) {
-			ERROR("Unexpected EOF (end of file), the tarfile appears to be truncated or corrupted\n");
+		if(res < 512) {
+			if(res != -1)
+				ERROR("Unexpected EOF (end of file), the tarfile appears to be truncated or corrupted\n");
 			free(name);
 			return NULL;
 		}
@@ -167,7 +177,7 @@ char *read_long_string(int size, int skip)
 }
 
 
-int all_zero(struct tar_header *header)
+static int all_zero(struct tar_header *header)
 {
 	int i;
 
@@ -179,14 +189,15 @@ int all_zero(struct tar_header *header)
 }
 
 
-int checksum_matches(struct tar_header *header)
+static int checksum_matches(struct tar_header *header, int silent)
 {
 	int checksum = read_number(header->checksum, 8);
 	int computed = 0;
 	int i;
 
 	if(checksum == -1) {
-		ERROR("Failed to read checksum in tar header\n");
+		if(!silent)
+			ERROR("Failed to read checksum in tar header\n");
 		return FALSE;
 	}
 
@@ -244,7 +255,9 @@ static struct inode_info *new_inode(struct tar_file *tar_file)
 	inode->inode = SQUASHFS_INVALID_BLK;
 	inode->nlink = 1;
 	inode->inode_number = 0;
+	inode->pseudo = NULL;
 	inode->dummy_root_dir = FALSE;
+	inode->xattr = NULL;
 	inode->tarfile = TRUE;
 
 	/*
@@ -265,6 +278,21 @@ static struct inode_info *new_inode(struct tar_file *tar_file)
 }
 
 
+static struct inode_info *copy_inode(struct inode_info *source)
+{
+	struct inode_info *inode;
+	int bytes = S_ISLNK(source->buf.st_mode) ? strlen(source->symlink) + 1 : 0;
+
+	inode = malloc(sizeof(struct inode_info) + bytes);
+	if(inode == NULL)
+		MEM_ERROR();
+
+	memcpy(inode, source, sizeof(struct inode_info) + bytes);
+
+	return inode;
+}
+
+
 static void fixup_tree(struct dir_info *dir)
 {
 	struct dir_ent *entry;
@@ -276,13 +304,24 @@ static void fixup_tree(struct dir_info *dir)
 			struct stat buf;
 
 			memset(&buf, 0, sizeof(buf));
-			buf.st_mode = S_IRWXU | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH | S_IFDIR;
-			buf.st_uid = getuid();
-			buf.st_gid = getgid();
+			if(default_mode_opt)
+				buf.st_mode = default_mode | S_IFDIR;
+			else
+				buf.st_mode = S_IRWXU | S_IRGRP | S_IXGRP |
+					S_IROTH | S_IXOTH | S_IFDIR;
+			if(default_uid_opt)
+				buf.st_uid = default_uid;
+			else
+				buf.st_uid = getuid();
+			if(default_gid_opt)
+				buf.st_gid = default_gid;
+			else
+				buf.st_gid = getgid();
 			buf.st_mtime = time(NULL);
 			buf.st_dev = 0;
 			buf.st_ino = 0;
 			entry->inode = lookup_inode(&buf);
+			entry->inode->tar_file = NULL;
 			entry->inode->tarfile = TRUE;
 		}
 		
@@ -377,6 +416,8 @@ static struct dir_info *add_tarfile(struct dir_info *sdir, char *source,
 					goto failed_early;
 			}
 		}
+
+		free(name);
 	} else {
 		/*
 		 * No matching name found.
@@ -395,12 +436,14 @@ static struct dir_info *add_tarfile(struct dir_info *sdir, char *source,
 			if(S_ISDIR(tarfile->buf.st_mode)) {
 				add_dir_entry(entry, NULL, new_inode(tarfile));
 				dir->directory_count ++;
-			} else {
-				struct inode_info *new = link ? link : new_inode(tarfile);
-				add_dir_entry(entry, NULL, new);
+			} else if (link == FALSE) {
+				add_dir_entry(entry, NULL, new_inode(tarfile));
 				if(S_ISREG(tarfile->buf.st_mode))
 					*dir_ent = entry;
-			}
+			} else if(no_hardlinks)
+				add_dir_entry(entry, NULL, copy_inode(link));
+			else
+				add_dir_entry(entry, NULL, link);
 		} else {
 			subpath = subpathname(entry);
 			sub = add_tarfile(NULL, source, subpath, tarfile, new, depth + 1, dir_ent, link);
@@ -516,7 +559,7 @@ int sparse_reader(struct tar_file *file, long long cur_offset, char *dest, int b
 }
 
 
-int read_sparse_block(struct tar_file *file, int fd, char *dest, int bytes, int block)
+static int read_sparse_block(struct tar_file *file, int fd, char *dest, int bytes, int block)
 {
 	static long long offset;
 	long long cur_offset = (long long) block * block_size;
@@ -571,7 +614,6 @@ static void skip_file(struct tar_file *tar_file)
 	progress_bar_size(-blocks);
 }
 
-static int seq = 0;
 static void read_tar_data(struct tar_file *tar_file)
 {
 	struct stat *buf = &tar_file->buf;
@@ -587,7 +629,7 @@ static void read_tar_data(struct tar_file *tar_file)
 		file_buffer = cache_get_nohash(reader_buffer);
 		file_buffer->file_size = read_size;
 		file_buffer->tar_file = tar_file;
-		file_buffer->sequence = seq ++;
+		file_buffer->sequence = sequence_count ++;
 		file_buffer->noD = noD;
 		file_buffer->error = FALSE;
 
@@ -620,7 +662,7 @@ static void read_tar_data(struct tar_file *tar_file)
 }
 
 
-char *skip_components(char *filename, int size, int *sizep)
+static char *skip_components(char *filename, int size, int *sizep)
 {
 	while(1) {
 		if(size >= 3 && strncmp(filename, "../", 3) == 0) {
@@ -643,7 +685,7 @@ char *skip_components(char *filename, int size, int *sizep)
 }
 
 
-int read_sparse_value(struct tar_file *file, char *value, int map_entries)
+static int read_sparse_value(struct tar_file *file, char *value, int map_entries)
 {
 	int bytes, res, i = 0;
 	long long number;
@@ -676,7 +718,7 @@ failed:
 }
 
 
-int read_pax_header(struct tar_file *file, long long st_size)
+static int read_pax_header(struct tar_file *file, long long st_size)
 {
 	long long size = (st_size + 511) & ~511;
 	char *data, *ptr, *end, *keyword, *value;
@@ -692,8 +734,9 @@ int read_pax_header(struct tar_file *file, long long st_size)
 		MEM_ERROR();
 
 	res = read_bytes(STDIN_FILENO, data, size);
-	if(res == FALSE) {
-		ERROR("Unexpected EOF (end of file), the tarfile appears to be truncated or corrupted\n");
+	if(res < size) {
+		if(res != -1)
+			ERROR("Unexpected EOF (end of file), the tarfile appears to be truncated or corrupted\n");
 		free(data);
 		return FALSE;
 	}
@@ -772,7 +815,7 @@ int read_pax_header(struct tar_file *file, long long st_size)
 		else if(strcmp(keyword, "path") == 0)
 			file->pathname = strdup(skip_components(value, vsize, NULL));
 		else if(strcmp(keyword, "linkpath") == 0)
-			file->link = strdup(skip_components(value, vsize, NULL));
+			file->link = strdup(value);
 		else if(strcmp(keyword, "GNU.sparse.major") == 0) {
 			res = sscanf(value, "%lld %n", &number, &bytes);
 			if(res < 1 || value[bytes] != '\0')
@@ -829,10 +872,15 @@ int read_pax_header(struct tar_file *file, long long st_size)
 			read_tar_xattr(keyword + strlen("LIBARCHIVE.xattr."), value, strlen(value), ENCODING_BASE64, file);
 		else if(strncmp(keyword, "SCHILY.xattr.", strlen("SCHILY.xattr.")) == 0)
 			read_tar_xattr(keyword + strlen("SCHILY.xattr."), value, vsize, ENCODING_BINARY, file);
-		else if(strcmp(keyword, "GNU.sparse.numblocks") != 0 && strcmp(keyword, "GNU.sparse.offset") != 0 && strcmp(keyword, "GNU.sparse.numbytes") != 0 && strcmp(keyword, "GNU.sparse.map") != 0 && strcmp(keyword, "atime") != 0 && strcmp(keyword, "ctime") != 0 && strcmp(keyword, "comment") != 0)
+		else if(strcmp(keyword, "GNU.sparse.numblocks") != 0 &&
+				strcmp(keyword, "GNU.sparse.offset") != 0 &&
+				strcmp(keyword, "GNU.sparse.numbytes") != 0 &&
+				strcmp(keyword, "GNU.sparse.map") != 0 &&
+				strcmp(keyword, "atime") != 0 &&
+				strcmp(keyword, "ctime") != 0 &&
+				strcmp(keyword, "comment") != 0)
 			ERROR("Unrecognised keyword \"%s\" in pax header, ignoring\n", keyword);
 
-		//printf("%s = %s\n", keyword, value);
 		ptr += length;
 	}
 
@@ -869,7 +917,7 @@ failed:
 }
 
 
-int check_sparse_map(struct file_map *map, int map_entries, long long size, long long realsize)
+static int check_sparse_map(struct file_map *map, int map_entries, long long size, long long realsize)
 {
 	long long total_data = 0;
 	long long total_sparse = map[0].offset;
@@ -885,7 +933,7 @@ int check_sparse_map(struct file_map *map, int map_entries, long long size, long
 }
 
 
-struct file_map *read_sparse_headers(struct tar_file *file, struct short_sparse_header *short_header, int *entries)
+static struct file_map *read_sparse_headers(struct tar_file *file, struct short_sparse_header *short_header, int *entries)
 {
 	struct long_sparse_header long_header;
 	int res, i, map_entries, isextended;
@@ -946,8 +994,9 @@ struct file_map *read_sparse_headers(struct tar_file *file, struct short_sparse_
 
 	while(isextended) {
 		res = read_bytes(STDIN_FILENO, &long_header, 512);
-		if(res == FALSE) {
-			ERROR("Unexpected EOF (end of file), the tarfile appears to be truncated or corrupted\n");
+		if(res < 512) {
+			if(res != -1)
+				ERROR("Unexpected EOF (end of file), the tarfile appears to be truncated or corrupted\n");
 			goto failed;
 		}
 
@@ -1002,17 +1051,18 @@ failed:
 }
 
 
-struct file_map *read_sparse_map(struct tar_file *file, int *entries)
+static struct file_map *read_sparse_map(struct tar_file *file, int *entries)
 {
 	int map_entries, bytes, size;
 	struct file_map *map = NULL;
 	char buffer[529], *src = buffer;
-	long long offset, number, res;
+	long long offset = 0, number, res;
 	int atoffset = TRUE, i = 0;
 
 	res = read_bytes(STDIN_FILENO, buffer, 512);
-	if(res == FALSE) {
-		ERROR("Unexpected EOF (end of file), the tarfile appears to be truncated or corrupted\n");
+	if(res < 512) {
+		if(res != -1)
+			ERROR("Unexpected EOF (end of file), the tarfile appears to be truncated or corrupted\n");
 		goto failed;
 	}
 
@@ -1044,8 +1094,9 @@ struct file_map *read_sparse_map(struct tar_file *file, int *entries)
 
 			memmove(buffer, src, size);
 			res = read_bytes(STDIN_FILENO, buffer + size, 512);
-			if(res == FALSE) {
-				ERROR("Unexpected EOF (end of file), the tarfile appears to be truncated or corrupted\n");
+			if(res < 512) {
+				if(res != -1)
+					ERROR("Unexpected EOF (end of file), the tarfile appears to be truncated or corrupted\n");
 				goto failed;
 			}
 
@@ -1099,6 +1150,35 @@ static void copy_tar_header(struct tar_file *dest, struct tar_file *source)
 }
 
 
+static int skip_to_valid_header(struct tar_header *header)
+{
+	int res, first = TRUE;
+
+	while(1) {
+		res = read_bytes(STDIN_FILENO, header, 512);
+
+		if(res < 512) {
+			if(res == 0)
+				return 0;
+			if(res != -1)
+				ERROR("Unexpected EOF (end of file), the tarfile appears to be truncated or corrupted\n");
+			return -1;
+		}
+
+		if(all_zero(header))
+			continue;
+
+		if(checksum_matches(header, TRUE))
+			return 1;
+
+		if(first) {
+			ERROR("sqfstar: Skipping to next header\n");
+			first = FALSE;
+		}
+	}
+}
+
+
 static struct tar_file *read_tar_header(int *status)
 {
 	struct tar_header header;
@@ -1119,17 +1199,24 @@ static struct tar_file *read_tar_header(int *status)
 
 again:
 	res = read_bytes(STDIN_FILENO, &header, 512);
-	if(res == FALSE) {
-		ERROR("Unexpected EOF (end of file), the tarfile appears to be truncated or corrupted\n");
+	if(res < 512) {
+		if(res == 0)
+			goto eof;
+		if(res != -1)
+			ERROR("Unexpected EOF (end of file), the tarfile appears to be truncated or corrupted\n");
 		goto failed;
 	}
 
 	if(all_zero(&header)) {
-		*status = TAR_EOF;
-		return NULL;
-	}
-
-	if(checksum_matches(&header) == FALSE) {
+		if(ignore_zeros) {
+			res = skip_to_valid_header(&header);
+			if(res == 0)
+				goto eof;
+			if(res == -1)
+				goto failed;
+		} else
+			goto eof;
+	} else if(checksum_matches(&header, FALSE) == FALSE) {
 		ERROR("Tar header checksum does not match!\n");
 		goto failed;
 	}
@@ -1363,9 +1450,20 @@ again:
 	}
 
 	/* Handle hard links */
-	if(type == S_IFHRD && file->link == FALSE) {
-		filename = skip_components(header.link, 100, &size);
-		file->link = strndup(filename, size);
+	if(type == S_IFHRD) {
+		if(file->link) {
+			char *link = skip_components(file->link, strlen(file->link), NULL);
+
+			if(link != file->link) {
+				char *old = file->link;
+
+				file->link = strdup(link);
+				free(old);
+			}
+		} else {
+			filename = skip_components(header.link, 100, &size);
+			file->link = strndup(filename, size);
+		}
 	}
 
 	*status = TAR_OK;
@@ -1386,8 +1484,9 @@ ignored:
 
 		while(size > 0) {
 			res = read_bytes(STDIN_FILENO, &header, 512);
-			if(res == FALSE) {
-				ERROR("Unexpected EOF (end of file), the tarfile appears to be truncated or corrupted\n");
+			if(res < 512) {
+				if(res != -1)
+					ERROR("Unexpected EOF (end of file), the tarfile appears to be truncated or corrupted\n");
 				goto failed;
 			}
 			size -= 512;
@@ -1398,6 +1497,11 @@ ignored:
 	free(file->link);
 	free(file);
 	*status = TAR_IGNORED;
+	return NULL;
+
+eof:
+	*status = TAR_EOF;
+	free(file);
 	return NULL;
 }
 
@@ -1443,8 +1547,9 @@ void read_tar_file()
 								 >> block_log);
 
 		file_buffer->cache = NULL;
+		file_buffer->fragment = FALSE;
 		file_buffer->tar_file = tar_file;
-		file_buffer->sequence = seq ++;
+		file_buffer->sequence = sequence_count ++;
 		seq_queue_put(to_main, file_buffer);
 
 		if(status == TAR_EOF)
@@ -1462,13 +1567,15 @@ squashfs_inode process_tar_file(int progress)
 	struct dir_info *new;
 	struct dir_ent *dir_ent;
 	struct tar_file *tar_file;
+	struct file_buffer *file_buffer;
 
 	queue_put(to_reader, NULL);
 	set_progressbar_state(progress);
 
 	while(1) {
 		struct inode_info *link = NULL;
-		struct file_buffer *file_buffer = seq_queue_get(to_main);
+
+		file_buffer = seq_queue_get(to_main);
 		if(file_buffer->tar_file == NULL)
 			break;
 
@@ -1512,17 +1619,26 @@ squashfs_inode process_tar_file(int progress)
 				update_info(dir_ent);
 				tar_file->file = write_file(dir_ent, &duplicate_file);
 				dir_ent->inode->read = TRUE;
-				INFO("file %s, uncompressed size %lld " "bytes %s\n", tar_file->pathname,
+				INFO("file %s, uncompressed size %lld bytes %s\n", tar_file->pathname,
 					(long long) tar_file->buf.st_size, duplicate_file ?  "DUPLICATE" : "");
 			}
 
-			if(link)
-				link->nlink ++;
+			if(link) {
+				if(no_hardlinks)
+					INFO("file %s, uncompressed size %lld bytes DUPLICATE\n", tar_file->pathname,
+						(long long) link->buf.st_size);
+				else
+					link->nlink ++;
+				free(tar_file->pathname);
+				free(tar_file);
+			}
 		} else if(S_ISREG(tar_file->buf.st_mode))
 			skip_file(file_buffer->tar_file);
 
 		free(file_buffer);
 	}
+
+	free(file_buffer);
 
 	if(root_dir)
 		fixup_tree(root_dir);
@@ -1538,9 +1654,23 @@ squashfs_inode process_tar_file(int progress)
 		buf.st_mode = root_mode | S_IFDIR;
 	else
 		buf.st_mode = S_IRWXU | S_IRWXG | S_IRWXO | S_IFDIR;
-	buf.st_uid = getuid();
-	buf.st_gid = getgid();
-	buf.st_mtime = time(NULL);
+	if(root_uid_opt)
+		buf.st_uid = root_uid;
+	else
+		buf.st_uid = getuid();
+	if(root_gid_opt)
+		buf.st_gid = root_gid;
+	else
+		buf.st_gid = getgid();
+	if(root_time_opt)
+		buf.st_mtime = root_time;
+	else
+		buf.st_mtime = time(NULL);
+	if(pseudo_override && global_uid_opt)
+		buf.st_uid = global_uid;
+
+	if(pseudo_override && global_gid_opt)
+		buf.st_gid = global_gid;
 	buf.st_dev = 0;
 	buf.st_ino = 0;
 	dir_ent->inode = lookup_inode(&buf);

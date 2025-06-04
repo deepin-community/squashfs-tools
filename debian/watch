@@ -1,3 +1,4 @@
 version=4
-opts=uversionmangle=s/-?(beta)-?/~$1/;s/-?(alpha)-?/~$1/;s/-?(rc)-?/~rc/ \
-	https://github.com/plougher/squashfs-tools/releases .*/(?:|v|version-|version|release-|r)(\d[^\s/]*)\.(?:tar\.xz|txz|tar\.bz2|tbz2|tar\.gz|tgz|zip)
+opts=uversionmangle=s/^(SNAPSHOT|RELEASE)\.//;s/(\d+)[_-](\d+)[_-](\d+)/\$1.\$2.\$3/;s/(\d+)[_-](\d+)/\$1.\$2/;s/(\d)[_\.\-\+]?((rc|pre|dev|beta|alpha|b|a)[\-\.]?\d*)$/$1~$2/;s/(\d)[_\.\-\+]?RC[\-\.]?(\d*)$/$1~rc$2/,\
+dversionmangle=s/\+(debian|dfsg|ds|deb)(\.?\d+)?$//i \
+https://github.com/plougher/squashfs-tools/tags .*/[vV]?(\d\S*)@ARCHIVE_EXT@

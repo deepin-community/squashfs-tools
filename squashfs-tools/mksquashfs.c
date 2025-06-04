@@ -3,7 +3,7 @@
  * filesystem.
  *
  * Copyright (c) 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2009, 2010, 2011,
- * 2012, 2013, 2014, 2017, 2019, 2021
+ * 2012, 2013, 2014, 2017, 2019, 2021, 2022, 2023
  * Phillip Lougher <phillip@squashfs.org.uk>
  *
  * This program is free software; you can redistribute it and/or
@@ -35,14 +35,12 @@
 #include <stddef.h>
 #include <sys/types.h>
 #include <sys/stat.h>
-#include <sys/sysmacros.h>
 #include <fcntl.h>
 #include <errno.h>
 #include <dirent.h>
 #include <string.h>
 #include <stdlib.h>
 #include <signal.h>
-#include <setjmp.h>
 #include <sys/types.h>
 #include <sys/mman.h>
 #include <pthread.h>
@@ -50,9 +48,12 @@
 #include <sys/wait.h>
 #include <limits.h>
 #include <ctype.h>
-#include <sys/sysinfo.h>
 
-#ifndef linux
+#ifdef __linux__
+#include <sys/sysinfo.h>
+#include <sys/sysmacros.h>
+#include <sched.h>
+#else
 #include <sys/sysctl.h>
 #endif
 
@@ -73,40 +74,119 @@
 #include "process_fragments.h"
 #include "fnmatch_compat.h"
 #include "tar.h"
+#include "merge_sort.h"
 
-int delete = FALSE;
-int quiet = FALSE;
-int fd;
-struct squashfs_super_block sBlk;
-
-/* filesystem flags for building */
-int comp_opts = FALSE;
-int no_xattrs = XATTR_DEF;
-int noX = FALSE;
-int duplicate_checking = TRUE;
+/* Compression options */
 int noF = FALSE;
-int no_fragments = FALSE;
-int always_use_fragments = FALSE;
 int noI = FALSE;
 int noId = FALSE;
 int noD = FALSE;
-int silent = TRUE;
-int exportable = TRUE;
-int sparse_files = TRUE;
-int old_exclude = TRUE;
-int use_regex = FALSE;
-int nopad = FALSE;
-int exit_on_error = FALSE;
-long long start_offset = 0;
-int sleep_time = 0;
+int noX = FALSE;
 
-long long global_uid = -1, global_gid = -1;
+/* block size used to build filesystem */
+int block_size = SQUASHFS_FILE_SIZE;
+int block_log;
+
+/* Fragment options, are fragments in filesystem and are they used for tailends? */
+int no_fragments = FALSE;
+int always_use_fragments = FALSE;
+
+/* Are duplicates detected in fileystem ? */
+int duplicate_checking = TRUE;
+
+/* Are filesystems exportable via NFS? */
+int exportable = TRUE;
+
+/* Are sparse files detected and stored? */
+int sparse_files = TRUE;
+
+/* Options which override root inode settings */
+int root_mode_opt = FALSE;
+mode_t root_mode;
+int root_uid_opt = FALSE;
+unsigned int root_uid;
+int root_gid_opt = FALSE;
+unsigned int root_gid;
+unsigned int root_time;
+int root_time_opt = FALSE;
+
+/* Values that override uids and gids for all files and directories */
+int global_uid_opt = FALSE;
+unsigned int global_uid;
+int global_gid_opt = FALSE;
+unsigned int global_gid;
+
+/* Do pseudo uids and guids override -all-root, -force-uid and -force-gid? */
+int pseudo_override = FALSE;
+
+/* Time value over-ride options */
+unsigned int mkfs_time;
+int mkfs_time_opt = FALSE;
+unsigned int all_time;
+int all_time_opt = FALSE;
+int clamping = TRUE;
+
+/* Is max depth option in effect, and max depth to descend into directories */
+int max_depth_opt = FALSE;
+unsigned int max_depth;
+
+/* how should Mksquashfs treat the source files? */
+int tarstyle = FALSE;
+int keep_as_directory = FALSE;
+
+/* should Mksquashfs read files from stdin, like cpio? */
+int cpiostyle = FALSE;
+char filename_terminator = '\n';
+
+/* Should Mksquashfs detect hardlinked files? */
+int no_hardlinks = FALSE;
+
+/* Should Mksquashfs cross filesystem boundaries? */
+int one_file_system = FALSE;
+int one_file_system_x = FALSE;
+dev_t *source_dev;
+dev_t cur_dev;
+
+/* Is Mksquashfs processing a tarfile? */
+int tarfile = FALSE;
+
+/* Is Mksquashfs reading a pseudo file from stdin? */
+int pseudo_stdin = FALSE;
+
+/* Is Mksquashfs storing Xattrs, or excluding/including xattrs using regexs? */
+int no_xattrs = XATTR_DEF;
+unsigned int xattr_bytes = 0, total_xattr_bytes = 0;
+regex_t *xattr_exclude_preg = NULL;
+regex_t *xattr_include_preg = NULL;
+
+/* Does Mksquashfs print a summary and other information when running? */
+int quiet = FALSE;
+
+/* Does Mksquashfs display filenames as they are archived? */
+int silent = TRUE;
+
+/* Is Mksquashfs using the older non-wildcard exclude code? */
+int old_exclude = TRUE;
+
+/* Is Mksquashfs using regexs in exclude file matching (default wildcards)? */
+int use_regex = FALSE;
+
+/* Will Mksquashfs pad the filesystem to a multiple of 4 Kbytes? */
+int nopad = FALSE;
+
+/* Should Mksquashfs treat normally ignored errors as fatal? */
+int exit_on_error = FALSE;
+
+/* Is filesystem stored at an offset from the start of the block device/file? */
+long long start_offset = 0;
+
+/* File count statistics used to print summary and fill in superblock */
+unsigned int file_count = 0, sym_count = 0, dev_count = 0, dir_count = 0,
+fifo_count = 0, sock_count = 0, id_count = 0;
+long long hardlnk_count = 0;
 
 /* superblock attributes */
-int block_size = SQUASHFS_FILE_SIZE, block_log;
-unsigned int id_count = 0;
-unsigned int file_count = 0, sym_count = 0, dev_count = 0, dir_count = 0, fifo_count = 0,
-	sock_count = 0;
+struct squashfs_super_block sBlk;
 
 /* write position within data section */
 long long bytes = 0, total_bytes = 0;
@@ -129,7 +209,6 @@ unsigned int cache_bytes = 0, cache_size = 0, inode_count = 0;
 
 /* inode lookup table */
 squashfs_inode *inode_lookup_table = NULL;
-
 struct inode_info *inode_info[INODE_HASH_SIZE];
 
 /* hash tables used to do fast duplicate searches in duplicate check */
@@ -139,7 +218,6 @@ unsigned int dup_files = 0;
 
 int exclude = 0;
 struct exclude_info *exclude_paths = NULL;
-static int old_excluded(char *filename, struct stat *buf);
 
 struct path_entry {
 	char *name;
@@ -167,27 +245,6 @@ int source = 0;
 char **source_path;
 int option_offset;
 
-/* list of root directory entries read from original filesystem */
-int old_root_entries = 0;
-struct old_root_entry_info *old_root_entry;
-
-/* restore orignal filesystem state if appending to existing filesystem is
- * cancelled */
-int appending = FALSE;
-char *sdata_cache, *sdirectory_data_cache, *sdirectory_compressed;
-
-long long sbytes, stotal_bytes;
-
-long long sinode_bytes, stotal_inode_bytes;
-long long sdirectory_bytes, stotal_directory_bytes;
-
-unsigned int scache_bytes, sdirectory_cache_bytes,
-	sdirectory_compressed_bytes, sinode_count = 0,
-	sfile_count, ssym_count, sdev_count, sdir_count,
-	sfifo_count, ssock_count, sdup_files;
-unsigned int sfragments;
-int threads;
-
 /* flag whether destination file is a block device */
 int block_device = FALSE;
 
@@ -197,21 +254,20 @@ int sorted = FALSE;
 /* save destination file name for deleting on error */
 char *destination_file = NULL;
 
-/* recovery file for abnormal exit on appending */
-char *recovery_file = NULL;
-char *recovery_pathname = NULL;
-int recover = TRUE;
-
 struct id *id_hash_table[ID_ENTRIES];
 struct id *id_table[SQUASHFS_IDS], *sid_table[SQUASHFS_IDS];
 unsigned int uid_count = 0, guid_count = 0;
 unsigned int sid_count = 0, suid_count = 0, sguid_count = 0;
 
+/* caches used to store buffers being worked on, and queues
+ * used to send buffers between threads */
 struct cache *reader_buffer, *fragment_buffer, *reserve_cache;
 struct cache *bwriter_buffer, *fwriter_buffer;
 struct queue *to_reader, *to_deflate, *to_writer, *from_writer,
 	*to_frag, *locked_fragment, *to_process_frag;
 struct seq_queue *to_main;
+
+/* pthread threads and mutexes */
 pthread_t reader_thread, writer_thread, main_thread;
 pthread_t *deflator_thread, *frag_deflator_thread, *frag_thread;
 pthread_t *restore_thread = NULL;
@@ -223,41 +279,19 @@ pthread_mutex_t	dup_mutex = PTHREAD_MUTEX_INITIALIZER;
 struct seq_queue *to_order;
 pthread_t order_thread;
 pthread_cond_t fragment_waiting = PTHREAD_COND_INITIALIZER;
-
+int sequence_count = 0;
 int reproducible = REP_DEF;
-
-/* Options which over-ride root directory settings */
-int root_mode_opt = FALSE;
-mode_t root_mode;
-int root_uid_opt = FALSE;
-unsigned int root_uid;
-int root_gid_opt = FALSE;
-unsigned int root_gid;
-unsigned int root_time;
-int root_time_opt = FALSE;
-
-/* Time value over-ride options */
-unsigned int mkfs_time;
-int mkfs_time_opt = FALSE;
-
-unsigned int all_time;
-int all_time_opt = FALSE;
-int clamping = TRUE;
 
 /* user options that control parallelisation */
 int processors = -1;
 int bwriter_size;
 
-/* compression operations */
+/* Compressor options (-X) and initialised compressor (-comp XXX) */
+int comp_opts = FALSE;
+int X_opt_parsed = FALSE;
 struct compressor *comp = NULL;
 int compressor_opt_parsed = FALSE;
 void *stream = NULL;
-
-/* xattr stats */
-unsigned int xattr_bytes = 0, total_xattr_bytes = 0;
-
-/* fragment to file mapping used when appending */
-struct append_file **file_mapping;
 
 /* root of the in-core directory structure */
 struct dir_info *root_dir;
@@ -266,51 +300,66 @@ struct dir_info *root_dir;
 FILE *log_fd;
 int logging=FALSE;
 
-/* how should Mksquashfs treat the source files? */
-int tarstyle = FALSE;
-int keep_as_directory = FALSE;
+/* file descriptor of the output filesystem */
+int fd;
 
-/* should Mksquashfs read files from stdin, like cpio? */
-int cpiostyle = FALSE;
-char filename_terminator = '\n';
+/* Variables used for appending */
+int appending = TRUE;
 
-/* Should Mksquashfs detect hardlinked files? */
-int no_hardlinks = FALSE;
+/* restore orignal filesystem state if appending to existing filesystem is
+ * cancelled */
+char *sdata_cache, *sdirectory_data_cache, *sdirectory_compressed;
+long long sbytes, stotal_bytes;
+long long sinode_bytes, stotal_inode_bytes;
+long long sdirectory_bytes, stotal_directory_bytes;
+unsigned int scache_bytes, sdirectory_cache_bytes,
+	sdirectory_compressed_bytes, sinode_count = 0,
+	sfile_count, ssym_count, sdev_count, sdir_count,
+	sfifo_count, ssock_count, sdup_files;
+unsigned int sfragments;
 
-/* Should Mksquashfs cross filesystem boundaries? */
-int one_file_system = FALSE;
-dev_t *source_dev;
-dev_t cur_dev;
+/* list of root directory entries read from original filesystem */
+int old_root_entries = 0;
+struct old_root_entry_info *old_root_entry;
 
-/* Is Mksquashfs processing a tarfile? */
-int tarfile = FALSE;
+/* fragment to file mapping used when appending */
+struct append_file **file_mapping;
+
+/* recovery file for abnormal exit on appending */
+char *recovery_file = NULL;
+char *recovery_pathname = NULL;
+int recover = TRUE;
 
 /* list of options that have an argument */
-char *option_table[] = { "comp", "b", "mkfs-time", "fstime", "all-time", "root-mode",
-	"force-uid", "force-gid", "action", "log-action", "true-action",
-	"false-action", "action-file", "log-action-file", "true-action-file",
-	"false-action-file", "p", "pf", "sort", "root-becomes", "recover",
-	"recovery-path", "throttle", "limit", "processors", "mem", "offset",
-	"o", "log", "a", "va", "ta", "fa", "af", "vaf", "taf", "faf",
-	"read-queue", "write-queue", "fragment-queue", "root-time", "root-uid",
-	"root-gid", NULL
+char *option_table[] = { "comp", "b", "mkfs-time", "fstime", "all-time",
+	"root-mode", "force-uid", "force-gid", "action", "log-action",
+	"true-action", "false-action", "action-file", "log-action-file",
+	"true-action-file", "false-action-file", "p", "pf", "sort",
+	"root-becomes", "recover", "recovery-path", "throttle", "limit",
+	"processors", "mem", "offset", "o", "log", "a", "va", "ta", "fa", "af",
+	"vaf", "taf", "faf", "read-queue", "write-queue", "fragment-queue",
+	"root-time", "root-uid", "root-gid", "xattrs-exclude", "xattrs-include",
+	"xattrs-add", "default-mode", "default-uid", "default-gid",
+	"mem-percent", NULL
 };
 
 char *sqfstar_option_table[] = { "comp", "b", "mkfs-time", "fstime", "all-time",
 	"root-mode", "force-uid", "force-gid", "throttle", "limit",
 	"processors", "mem", "offset", "o", "root-time", "root-uid",
-	"root-gid", NULL
+	"root-gid", "xattrs-exclude", "xattrs-include", "xattrs-add", "p", "pf",
+	"default-mode", "default-uid", "default-gid", "mem-percent", NULL
 };
 
 static char *read_from_disk(long long start, unsigned int avail_bytes);
 static void add_old_root_entry(char *name, squashfs_inode inode,
 	unsigned int inode_number, int type);
-static struct file_info *duplicate(int *dup, int *block_dup, long long file_size, long long bytes,
-	unsigned int *block_list, long long start, struct dir_ent *dir_ent,
+static struct file_info *duplicate(int *dup, int *block_dup,
+	long long file_size, long long bytes, unsigned int *block_list,
+	long long start, struct dir_ent *dir_ent,
 	struct file_buffer *file_buffer, int blocks, long long sparse,
 	int bl_hash);
 static struct dir_info *dir_scan1(char *, char *, struct pathnames *,
-	struct dir_ent *(_readdir)(struct dir_info *), int);
+	struct dir_ent *(_readdir)(struct dir_info *), unsigned int);
 static void dir_scan2(struct dir_info *dir, struct pseudo *pseudo);
 static void dir_scan3(struct dir_info *dir);
 static void dir_scan4(struct dir_info *dir, int symlink);
@@ -321,18 +370,20 @@ static struct dir_ent *scan1_readdir(struct dir_info *dir);
 static struct dir_ent *scan1_single_readdir(struct dir_info *dir);
 static struct dir_ent *scan1_encomp_readdir(struct dir_info *dir);
 static struct file_info *add_non_dup(long long file_size, long long bytes,
-	unsigned int blocks, long long sparse, unsigned int *block_list, long long start,
-	struct fragment *fragment, unsigned short checksum,
-	unsigned short fragment_checksum, int checksum_flag, int checksum_frag_flag,
-	int blocks_dup, int frag_dup, int bl_hash);
+	unsigned int blocks, long long sparse, unsigned int *block_list,
+	long long start, struct fragment *fragment, unsigned short checksum,
+	unsigned short fragment_checksum, int checksum_flag,
+	int checksum_frag_flag, int blocks_dup, int frag_dup, int bl_hash);
 long long generic_write_table(long long, void *, int, void *, int);
 void restorefs();
-struct dir_info *scan1_opendir(char *pathname, char *subpath, int depth);
+struct dir_info *scan1_opendir(char *pathname, char *subpath,
+							unsigned int depth);
 static void write_filesystem_tables(struct squashfs_super_block *sBlk);
 unsigned short get_checksum_mem(char *buff, int bytes);
 static void check_usable_phys_mem(int total_mem);
 static void print_summary();
 void write_destination(int fd, long long byte, long long bytes, void *buff);
+static int old_excluded(char *filename, struct stat *buf);
 
 
 void prep_exit()
@@ -352,7 +403,7 @@ void prep_exit()
 			pthread_kill(*restore_thread, SIGUSR1);
 			pthread_exit(NULL);
 		}
-	} else if(delete) {
+	} else if(!appending) {
 		if(destination_file && !block_device)
 			unlink(destination_file);
 	} else if(recovery_file)
@@ -390,7 +441,7 @@ int multiply_overflowll(long long a, int multiplier)
 
 void restorefs()
 {
-	int i;
+	int i, res;
 
 	ERROR("Exiting - restoring original filesystem!\n\n");
 
@@ -420,15 +471,23 @@ void restorefs()
 	restore_xattrs();
 	write_filesystem_tables(&sBlk);
 
-	if(!block_device)
-		ftruncate(fd, bytes);
+	if(!block_device) {
+		int res = ftruncate(fd, bytes);
+		if(res != 0)
+			BAD_ERROR("Failed to truncate dest file because %s\n",
+				strerror(errno));
+	}
 
 	if(!nopad && (i = bytes & (4096 - 1))) {
 		char temp[4096] = {0};
 		write_destination(fd, bytes, 4096 - i, temp);
 	}
 
-	close(fd);
+	res = close(fd);
+
+	if(res == -1)
+		BAD_ERROR("Failed to close output filesystem, close returned %s\n",
+				strerror(errno));
 
 	if(recovery_file)
 		unlink(recovery_file);
@@ -440,7 +499,7 @@ void restorefs()
 }
 
 
-void sighandler()
+void sighandler(int arg)
 {
 	EXIT_MKSQUASHFS();
 }
@@ -531,7 +590,8 @@ long long read_bytes(int fd, void *buff, long long bytes)
 	long long res, count;
 
 	for(count = 0; count < bytes; count += res) {
-		int len = (bytes - count) > SSIZE_MAX ? SSIZE_MAX : bytes - count;
+		int len = (bytes - count) > MAXIMUM_READ_SIZE ?
+					MAXIMUM_READ_SIZE : bytes - count;
 
 		res = read(fd, buff + count, len);
 		if(res < 1) {
@@ -580,7 +640,8 @@ int write_bytes(int fd, void *buff, long long bytes)
 	long long res, count;
 
 	for(count = 0; count < bytes; count += res) {
-		int len = (bytes - count) > SSIZE_MAX ? SSIZE_MAX : bytes - count;
+		int len = (bytes - count) > MAXIMUM_READ_SIZE ?
+					MAXIMUM_READ_SIZE : bytes - count;
 
 		res = write(fd, buff + count, len);
 		if(res == -1) {
@@ -892,7 +953,8 @@ squashfs_inode create_inode(struct dir_info *dir_info,
 	void *inode;
 	char *filename = pathname(dir_ent);
 	int nlink = dir_ent->inode->nlink;
-	int xattr = read_xattrs(dir_ent);
+	int xattr = read_xattrs(dir_ent, type);
+	unsigned int uid, gid;
 
 	switch(type) {
 	case SQUASHFS_FILE_TYPE:
@@ -927,13 +989,21 @@ squashfs_inode create_inode(struct dir_info *dir_info,
 			type = SQUASHFS_LSOCKET_TYPE;
 		break;
 	}
-			
+
+	if(!pseudo_override && global_uid_opt)
+		uid = global_uid;
+	else
+		uid = buf->st_uid;
+
+	if(!pseudo_override && global_gid_opt)
+		gid = global_gid;
+	else
+		gid = buf->st_gid;
+
 	base->mode = SQUASHFS_MODE(buf->st_mode);
-	base->uid = get_uid((unsigned int) global_uid == -1 ?
-		buf->st_uid : global_uid);
 	base->inode_type = type;
-	base->guid = get_guid((unsigned int) global_gid == -1 ?
-		buf->st_gid : global_gid);
+	base->uid = get_uid(uid);
+	base->guid = get_guid(gid);
 	base->mtime = get_time(buf->st_mtime);
 	base->inode_number = get_inode_no(dir_ent->inode);
 
@@ -1127,8 +1197,8 @@ squashfs_inode create_inode(struct dir_info *dir_info,
 
 	inode_count ++;
 
-	TRACE("Created inode 0x%llx, type %d, uid %d, guid %d\n", MKINODE(inode), type,
-		base->uid, base->guid);
+	TRACE("Created inode 0x%llx, type %d, uid %d, guid %d\n",
+				MKINODE(inode), type, base->uid, base->guid);
 
 	return MKINODE(inode);
 }
@@ -1349,7 +1419,7 @@ static struct file_buffer *get_fragment(struct fragment *fragment)
 	struct squashfs_fragment_entry *disk_fragment;
 	struct file_buffer *buffer, *compressed_buffer;
 	long long start_block;
-	int res, size, index = fragment->index;
+	int res, size, index = fragment->index, compressed;
 	char locked;
 
 	/*
@@ -1421,10 +1491,11 @@ again:
 	pthread_mutex_lock(&fragment_mutex);
 	disk_fragment = &fragment_table[index];
 	size = SQUASHFS_COMPRESSED_SIZE_BLOCK(disk_fragment->size);
+	compressed = SQUASHFS_COMPRESSED_BLOCK(disk_fragment->size);
 	start_block = disk_fragment->start_block;
 	pthread_cleanup_pop(1);
 
-	if(SQUASHFS_COMPRESSED_BLOCK(disk_fragment->size)) {
+	if(compressed) {
 		int error;
 		char *data;
 
@@ -1856,18 +1927,26 @@ void add_file(long long start, long long file_size, long long file_bytes,
 		}
 
 		if(dupl_ptr) {
-			/* Our blocks have already been added. If we don't
-			 * have a fragment, then we've finished checking  */
+			/*
+			 * Our blocks have already been added. If we don't
+			 * have a fragment, then we've finished checking
+			 */
 			if(fragment == SQUASHFS_INVALID_FRAG)
 				return;
 
-			/* This entry probably created both the blocks and
-			 * the tail-end fragment, and so check for that */
-			if((fragment == dupl_ptr->fragment->index) && (offset == dupl_ptr->fragment->offset) && (bytes == dupl_ptr->fragment->size))
+			/*
+			 * This entry probably created both the blocks and
+			 * the tail-end fragment, and so check for that
+			 */
+			if((fragment == dupl_ptr->fragment->index) &&
+					(offset == dupl_ptr->fragment->offset)
+					&& (bytes == dupl_ptr->fragment->size))
 				return;
 
-			/* Remember our blocks are duplicate, and continue
-			 * looking for the tail-end fragment */
+			/*
+			 * Remember our blocks are duplicate, and continue
+			 * looking for the tail-end fragment
+			 */
 			blocks_dup = TRUE;
 		}
 	}
@@ -1876,12 +1955,17 @@ void add_file(long long start, long long file_size, long long file_bytes,
 		dupl_ptr = dupl_frag[bytes];
 
 		for(; dupl_ptr; dupl_ptr = dupl_ptr->frag_next)
-			if((fragment == dupl_ptr->fragment->index) && (offset == dupl_ptr->fragment->offset) && (bytes == dupl_ptr->fragment->size))
+			if((fragment == dupl_ptr->fragment->index) &&
+					(offset == dupl_ptr->fragment->offset)
+					&& (bytes == dupl_ptr->fragment->size))
 				break;
 
 		if(dupl_ptr) {
-			/* Our tail-end fragment entry has already been added.
-			 * If there's no blocks or they're dup, then we're done here */
+			/*
+			 * Our tail-end fragment entry has already been added.
+			 * If there's no blocks or they're dup, then we're done
+			 * here
+			 */
 			if(blocks == 0 || blocks_dup)
 				return;
 
@@ -1898,8 +1982,8 @@ void add_file(long long start, long long file_size, long long file_bytes,
 	frg->offset = offset;
 	frg->size = bytes;
 
-	file = add_non_dup(file_size, file_bytes, blocks, 0, block_list, start, frg, 0, 0,
-		FALSE, FALSE, blocks_dup, frag_dup, bl_hash);
+	file = add_non_dup(file_size, file_bytes, blocks, 0, block_list, start,
+			frg, 0, 0, FALSE, FALSE, blocks_dup, frag_dup, bl_hash);
 
 	if(fragment == SQUASHFS_INVALID_FRAG)
 		return;
@@ -1914,13 +1998,15 @@ void add_file(long long start, long long file_size, long long file_bytes,
 }
 
 
-static int pre_duplicate(long long file_size, struct inode_info *inode, struct file_buffer *buffer, int *bl_hash)
+static int pre_duplicate(long long file_size, struct inode_info *inode,
+				struct file_buffer *buffer, int *bl_hash)
 {
 	struct file_info *dupl_ptr;
 	long long fragment_size;
 	int blocks;
 
-	if(inode->no_fragments || (!inode->always_use_fragments && file_size >= block_size)) {
+	if(inode->no_fragments || (!inode->always_use_fragments && file_size >=
+								block_size)) {
 		blocks = (file_size + block_size - 1) >> block_log;
 		fragment_size = 0;
 	} else {
@@ -1931,7 +2017,7 @@ static int pre_duplicate(long long file_size, struct inode_info *inode, struct f
 	/* Look for a possible duplicate set of blocks */
 	if(blocks) {
 		*bl_hash = block_hash(buffer->size, blocks);
-		for(dupl_ptr = dupl_block[*bl_hash]; dupl_ptr; dupl_ptr = dupl_ptr->block_next)
+		for(dupl_ptr = dupl_block[*bl_hash]; dupl_ptr;dupl_ptr = dupl_ptr->block_next)
 			if(dupl_ptr->blocks == blocks && dupl_ptr->block_list[0] == buffer->c_byte)
 				return TRUE;
 	}
@@ -2037,12 +2123,16 @@ static struct file_info *frag_duplicate(struct file_buffer *file_buffer, int *du
 	if(file_buffer->duplicate)
 		dupl_ptr = dupl_start;
 	else {
-		for(dupl_ptr = dupl_frag[file_size]; dupl_ptr && dupl_ptr != dupl_start; dupl_ptr = dupl_ptr->frag_next) {
+		for(dupl_ptr = dupl_frag[file_size];
+				dupl_ptr && dupl_ptr != dupl_start;
+				dupl_ptr = dupl_ptr->frag_next) {
 			if(file_size == dupl_ptr->fragment->size) {
 				if(get_fragment_checksum(dupl_ptr) == checksum) {
 					buffer = get_fragment(dupl_ptr->fragment);
-					res = memcmp(file_buffer->data, buffer->data +
-						dupl_ptr->fragment->offset, file_size);
+					res = memcmp(file_buffer->data,
+						buffer->data +
+						dupl_ptr->fragment->offset,
+						file_size);
 					cache_block_put(buffer);
 					if(res == 0)
 						break;
@@ -2066,7 +2156,8 @@ static struct file_info *frag_duplicate(struct file_buffer *file_buffer, int *du
 	} else {
 		struct dup_info *dup;
 
-		/* File also has a block list.  Create a new file without
+		/*
+		 * File also has a block list.  Create a new file without
 		 * a block_list, and link it to this file.  First check whether
 		 * it is already there.
 		 */
@@ -2079,7 +2170,8 @@ static struct file_info *frag_duplicate(struct file_buffer *file_buffer, int *du
 		if(dup == NULL)
 			MEM_ERROR();
 
-		dup->file = create_non_dup(file_size, 0, 0, 0, NULL, 0, dupl_ptr->fragment, 0, checksum, TRUE, TRUE);
+		dup->file = create_non_dup(file_size, 0, 0, 0, NULL, 0,
+				dupl_ptr->fragment, 0, checksum, TRUE, TRUE);
 		dup->next = NULL;
 		dupl_ptr->dup = dup;
 		*duplicate = FALSE;
@@ -2088,11 +2180,14 @@ static struct file_info *frag_duplicate(struct file_buffer *file_buffer, int *du
 }
 
 
-static struct file_info *duplicate(int *dupf, int *block_dup, long long file_size, long long bytes,
-	unsigned int *block_list, long long start, struct dir_ent *dir_ent,
-	struct file_buffer *file_buffer, int blocks, long long sparse, int bl_hash)
+static struct file_info *duplicate(int *dupf, int *block_dup,
+	long long file_size, long long bytes, unsigned int *block_list,
+	long long start, struct dir_ent *dir_ent,
+	struct file_buffer *file_buffer, int blocks, long long sparse,
+	int bl_hash)
 {
-	struct file_info *dupl_ptr, *block_dupl = NULL, *frag_dupl = NULL, *file;
+	struct file_info *dupl_ptr, *file;
+	struct file_info *block_dupl = NULL, *frag_dupl = NULL;
 	struct dup_info *dup;
 	int frag_bytes = file_buffer ? file_buffer->size : 0;
 	unsigned short fragment_checksum = file_buffer ?
@@ -2102,13 +2197,17 @@ static struct file_info *duplicate(int *dupf, int *block_dup, long long file_siz
 	struct fragment *fragment;
 
 	/* Look for a possible duplicate set of blocks */
-	for(dupl_ptr = dupl_block[bl_hash]; dupl_ptr; dupl_ptr = dupl_ptr->block_next) {
+	for(dupl_ptr = dupl_block[bl_hash]; dupl_ptr;
+					dupl_ptr = dupl_ptr->block_next) {
 		if(bytes == dupl_ptr->bytes && blocks == dupl_ptr->blocks) {
 			long long target_start, dup_start = dupl_ptr->start;
 			int block;
 
-			/* Block list has same uncompressed size and same compressed size.
-			 * Now check if each block compressed to the same size */
+			/*
+			 * Block list has same uncompressed size and same
+			 * compressed size.  Now check if each block compressed
+			 * to the same size
+			 */
 			if(memcmp(block_list, dupl_ptr->block_list, blocks *
 					sizeof(unsigned int)) != 0)
 				continue;
@@ -2129,7 +2228,10 @@ static struct file_info *duplicate(int *dupf, int *block_dup, long long file_siz
 			if(checksum != dupl_ptr->checksum)
 				continue;
 
-			/* Checksums match, so now we need to do a byte by byte comparison */
+			/*
+			 * Checksums match, so now we need to do a byte by byte
+			 * comparison
+			 */
 			target_start = start;
 			for(block = 0; block < blocks; block ++) {
 				int size = SQUASHFS_COMPRESSED_SIZE_BLOCK(block_list[block]);
@@ -2142,11 +2244,14 @@ static struct file_info *duplicate(int *dupf, int *block_dup, long long file_siz
 				if(size == 0)
 					continue;
 
-				/* Get the block for our file.  This will be in
-				 * the cache unless the cache wasn't large enough
-				 * to hold the entire file, in which case the block
-				 * will have been written to disk. */
-				target_buffer = cache_lookup(bwriter_buffer, target_start);
+				/*
+				 * Get the block for our file.  This will be in
+				 * the cache unless the cache wasn't large
+				 * enough to hold the entire file, in which case
+				 * the block will have been written to disk.
+				 */
+				target_buffer = cache_lookup(bwriter_buffer,
+								target_start);
 				if(target_buffer)
 					target_data = target_buffer->data;
 				else {
@@ -2159,9 +2264,12 @@ static struct file_info *duplicate(int *dupf, int *block_dup, long long file_siz
 					}
 				}
 
-				/* Get the block for the other file.  This may still
-				 * be in the cache (if it was written recently),
-				 * otherwise it will have to be read back from disk */
+				/*
+				 * Get the block for the other file.  This may
+				 * still be in the cache (if it was written
+				 * recently), otherwise it will have to be read
+				 * back from disk
+				 */
 				dup_buffer = cache_lookup(bwriter_buffer, dup_start);
 				if(dup_buffer)
 					dup_data = dup_buffer->data;
@@ -2187,37 +2295,69 @@ static struct file_info *duplicate(int *dupf, int *block_dup, long long file_siz
 			if(block != blocks)
 				continue;
 
-			/* Yes, the block list matches.  We can use this, rather
+			/*
+			 * Yes, the block list matches.  We can use this, rather
 			 * than writing an identical block list.
-			 * If both it and us doesn't have a tail-end fragment, then we're
-			 * finished.  Return the duplicate */
+			 * If both it and us doesn't have a tail-end fragment
+			 * then we're finished.  Return the duplicate.
+			 *
+			 * We have to deal with the special case where the
+			 * last block is a sparse block.  This means the
+			 * file will have matched, but, it may be a different
+			 * file length (because a tail-end sparse block may be
+			 * anything from 1 byte to block_size - 1 in size, but
+			 * stored as zero).  We can still use the block list in
+			 * this case, but, we must return a new entry with the
+			 * correct file size
+			 */
 			if(!frag_bytes && !dupl_ptr->fragment->size) {
 				*dupf = *block_dup = TRUE;
-				return dupl_ptr;
+				if(file_size == dupl_ptr->file_size)
+					return dupl_ptr;
+				else
+					return create_non_dup(file_size, bytes,
+						blocks, sparse,
+						dupl_ptr->block_list,
+						dupl_ptr->start,
+						dupl_ptr->fragment, checksum, 0,
+						checksum_flag, FALSE);
 			}
 
-			/* We've got a tail-end fragment, and this file most likely
-			 * has a matching tail-end fragment (i.e. it is a completely
-			 * duplicate file).  So save time and have a look now.
+			/*
+			 * We've got a tail-end fragment, and this file most
+			 * likely has a matching tail-end fragment (i.e. it is
+			 * a completely duplicate file).  So save time and have
+			 * a look now.
 			 */
-			if(frag_bytes == dupl_ptr->fragment->size && fragment_checksum == get_fragment_checksum(dupl_ptr)) {
-				/* Checksums match, so now we need to do a byte by byte comparison */
+			if(frag_bytes == dupl_ptr->fragment->size &&
+					fragment_checksum ==
+					get_fragment_checksum(dupl_ptr)) {
+				/*
+				 * Checksums match, so now we need to do a byte
+				 * by byte comparison
+				 * */
 				struct file_buffer *frag_buffer = get_fragment(dupl_ptr->fragment);
-				int res = memcmp(file_buffer->data, frag_buffer->data + dupl_ptr->fragment->offset, frag_bytes);
+				int res = memcmp(file_buffer->data,
+					frag_buffer->data +
+					dupl_ptr->fragment->offset, frag_bytes);
 
 				cache_block_put(frag_buffer);
 
 				if(res == 0) {
-					/* Yes, the fragment matches.  We're now finished.
-					 * Return the duplicate */
+					/*
+					 * Yes, the fragment matches.  We're now
+					 * finished.  Return the duplicate
+					 */
 					*dupf = *block_dup = TRUE;
 					return dupl_ptr;
 				}
 			}
 
-			/* No, the fragment didn't match.  Remember the file with
-			 * the matching blocks, and look for a matching fragment in
-			 * the fragment list */
+			/*
+			 * No, the fragment didn't match.  Remember the file
+			 * with the matching blocks, and look for a matching
+			 * fragment in the fragment list
+			 */
 			block_dupl = dupl_ptr;
 			break;
 		}
@@ -2225,25 +2365,39 @@ static struct file_info *duplicate(int *dupf, int *block_dup, long long file_siz
 
 	/* Look for a possible duplicate fragment */
 	if(frag_bytes) {
-		for(dupl_ptr = dupl_frag[frag_bytes]; dupl_ptr; dupl_ptr = dupl_ptr->frag_next) {
-			if(frag_bytes == dupl_ptr->fragment->size && fragment_checksum == get_fragment_checksum(dupl_ptr)) {
-				/* Checksums match, so now we need to do a byte by byte comparison */
+		for(dupl_ptr = dupl_frag[frag_bytes]; dupl_ptr;
+					dupl_ptr = dupl_ptr->frag_next) {
+			if(frag_bytes == dupl_ptr->fragment->size &&
+					fragment_checksum ==
+					get_fragment_checksum(dupl_ptr)) {
+				/*
+				 * Checksums match, so now we need to do a byte
+				 * by byte comparison
+				 */
 				struct file_buffer *frag_buffer = get_fragment(dupl_ptr->fragment);
-				int res = memcmp(file_buffer->data, frag_buffer->data + dupl_ptr->fragment->offset, frag_bytes);
+				int res = memcmp(file_buffer->data,
+					frag_buffer->data +
+					dupl_ptr->fragment->offset, frag_bytes);
 
 				cache_block_put(frag_buffer);
 
 				if(res == 0) {
-					/* Yes, the fragment matches.  This file may have
-					 * a matching block list and fragment, in which case
-					 * we're finished. */
+					/*
+					 * Yes, the fragment matches.  This file
+					 * may have a matching block list and
+					 * fragment, in which case we're
+					 * finished.
+					 */
 					if(block_dupl && block_dupl->start == dupl_ptr->start) {
 						*dupf = *block_dup = TRUE;
 						return dupl_ptr;
 					}
 
-					/* Block list doesn't match.  We can construct a hybrid
-					 * from these two partially matching files */
+					/*
+					 * Block list doesn't match.  We can
+					 * construct a hybrid from these two
+					 * partially matching files
+					 */
 					frag_dupl = dupl_ptr;
 					break;
 				}
@@ -2251,41 +2405,51 @@ static struct file_info *duplicate(int *dupf, int *block_dup, long long file_siz
 		}
 	}
 
-	/* If we've got here, then we've either matched on nothing, or got a partial match.
-	 * Matched on nothing is straightforward */
+	/*
+	 * If we've got here, then we've either matched on nothing, or got a
+	 * partial match.  Matched on nothing is straightforward
+	 */
 	if(!block_dupl && !frag_dupl) {
 		*dupf = *block_dup = FALSE;
 		fragment = get_and_fill_fragment(file_buffer, dir_ent, TRUE);
 
-		return add_non_dup(file_size, bytes, blocks, sparse, block_list, start, fragment, checksum,
-			fragment_checksum, checksum_flag, file_buffer != NULL, FALSE, FALSE, bl_hash);
+		return add_non_dup(file_size, bytes, blocks, sparse, block_list,
+				start, fragment, checksum, fragment_checksum,
+				checksum_flag, file_buffer != NULL, FALSE,
+				FALSE, bl_hash);
 	}
 
-	/* At this point, we may have
-	 * 1. A partially matching single file.  For example the file may contain
-	 *    the block list we want, but, it has the wrong tail-end, or vice-versa,
+	/*
+	 * At this point, we may have
+	 * 1. A partially matching single file.  For example the file may
+	 *    contain the block list we want, but, it has the wrong tail-end,
+	 *    or vice-versa,
 	 * 2. A partially matching single file for another reason.  For example
 	 *    it has the block list we want, and a tail-end, whereas we don't
-	 *    have a tail-end.  Note the vice-versa situation doesn't appear here
-	 *    (it is handled in frag_duplicate).
+	 *    have a tail-end.  Note the vice-versa situation doesn't appear
+	 *    here (it is handled in frag_duplicate).
 	 * 3. We have two partially matching files.  One has the block list we
 	 *    want, and the other has the tail-end we want.
 	 *
-	 * Strictly speaking, a file which is constructed from one or two partial
-	 * matches isn't a duplicate (of any single file), and it will be
-	 * confusing to list it as such (using the -info option).  But a
+	 * Strictly speaking, a file which is constructed from one or two
+	 * partial matches isn't a duplicate (of any single file), and it will
+	 * be confusing to list it as such (using the -info option).  But a
 	 * second and thereafter appearance of this combination *is* a
 	 * duplicate of another file.  Some of this second and thereafter
-	 * appearance is already handled above */
+	 * appearance is already handled above
+	 */
 
 	if(block_dupl && (!frag_bytes || frag_dupl)) {
-		/* This file won't be added to any hash list, because it is a complete
-		 * duplicate, and it doesn't need extra data to be stored, e.g. part 2 & 3 above.
-		 * So keep track of it by adding  it to a linked list.  Obviously check if it's
-		 * already there first.
+		/*
+		 * This file won't be added to any hash list, because it is a
+		 * complete duplicate, and it doesn't need extra data to be
+		 * stored, e.g. part 2 & 3 above.  So keep track of it by adding
+		 * it to a linked list.  Obviously check if it's already there
+		 * first.
 		 */
 		for(dup = block_dupl->dup; dup; dup = dup->next)
-			if((!frag_bytes && dup->frag == NULL) || (frag_bytes && dup->frag == frag_dupl))
+			if((!frag_bytes && dup->frag == NULL) ||
+					(frag_bytes && dup->frag == frag_dupl))
 				break;
 
 		if(dup) {
@@ -2308,12 +2472,15 @@ static struct file_info *duplicate(int *dupf, int *block_dup, long long file_siz
 	*dupf = FALSE;
 	*block_dup = block_dupl != NULL;
 
-	file = create_non_dup(file_size, bytes, blocks, sparse, block_list, start, fragment, checksum,
-		fragment_checksum, checksum_flag, file_buffer != NULL);
+	file = create_non_dup(file_size, bytes, blocks, sparse, block_list,
+		start, fragment, checksum, fragment_checksum, checksum_flag,
+		file_buffer != NULL);
 
 	if(!block_dupl || (frag_bytes && !frag_dupl)) {
-		/* Partial duplicate, had to store some extra data for this file,
-		 * either a block list, or a fragment */
+		/*
+		 * Partial duplicate, had to store some extra data for this
+		 * file, either a block list, or a fragment
+		 */
 		pthread_cleanup_push((void *) pthread_mutex_unlock, &dup_mutex);
 		pthread_mutex_lock(&dup_mutex);
 
@@ -2480,6 +2647,8 @@ static void *frag_deflator(void *arg)
 	}
 
 	pthread_cleanup_pop(0);
+	return NULL;
+
 }
 
 
@@ -2502,8 +2671,12 @@ static void *frag_order_deflator(void *arg)
 			file_buffer->size, block_size, noF, 1);
 		write_buffer->block = file_buffer->block;
 		write_buffer->sequence = file_buffer->sequence;
-		write_buffer->size = c_byte;
+		write_buffer->size = SQUASHFS_COMPRESSED_SIZE_BLOCK(c_byte);
 		write_buffer->fragment = FALSE;
+		pthread_cleanup_push((void *) pthread_mutex_unlock, &fragment_mutex);
+		pthread_mutex_lock(&fragment_mutex);
+		fragment_table[file_buffer->block].size = c_byte;
+		pthread_cleanup_pop(1);
 		seq_queue_put(to_order, write_buffer);
 		TRACE("Writing fragment %lld, uncompressed size %d, "
 			"compressed size %d\n", file_buffer->block,
@@ -2522,11 +2695,9 @@ static void *frag_orderer(void *arg)
 		int block = write_buffer->block;
 
 		pthread_mutex_lock(&fragment_mutex);
-		fragment_table[block].size = write_buffer->size;
 		fragment_table[block].start_block = bytes;
 		write_buffer->block = bytes;
 		bytes += SQUASHFS_COMPRESSED_SIZE_BLOCK(write_buffer->size);
-		write_buffer->size = SQUASHFS_COMPRESSED_SIZE_BLOCK(write_buffer->size);
 		fragments_outstanding --;
 		log_fragment(block, write_buffer->block);
 		queue_put(to_writer, write_buffer);
@@ -2535,6 +2706,7 @@ static void *frag_orderer(void *arg)
 	}
 
 	pthread_cleanup_pop(0);
+	return NULL;
 }
 
 
@@ -2552,7 +2724,8 @@ static struct file_info *write_file_empty(struct dir_ent *dir_ent,
 	file_count ++;
 	*duplicate_file = FALSE;
 	cache_block_put(file_buffer);
-	return create_non_dup(0, 0, 0, 0, NULL, 0, &empty_fragment, 0, 0, FALSE, FALSE);
+	return create_non_dup(0, 0, 0, 0, NULL, 0, &empty_fragment, 0, 0,
+								FALSE, FALSE);
 }
 
 
@@ -2569,11 +2742,11 @@ static struct file_info *write_file_frag(struct dir_ent *dir_ent,
 		fragment = get_and_fill_fragment(file_buffer, dir_ent, FALSE);
 
 		if(duplicate_checking)
-			file = add_non_dup(size, 0, 0, 0, NULL, 0, fragment, 0, checksum,
-				TRUE, TRUE, FALSE, FALSE, 0);
+			file = add_non_dup(size, 0, 0, 0, NULL, 0, fragment, 0,
+				checksum, TRUE, TRUE, FALSE, FALSE, 0);
 		else
-			file = create_non_dup(size, 0, 0, 0, NULL, 0, fragment, 0, checksum,
-				TRUE, TRUE);
+			file = create_non_dup(size, 0, 0, 0, NULL, 0, fragment,
+				0, checksum, TRUE, TRUE);
 	}
 
 	cache_block_put(file_buffer);
@@ -2655,13 +2828,14 @@ static struct file_info *write_file_process(int *status, struct dir_ent *dir_ent
 	if(duplicate_checking) {
 		int bl_hash = block ? block_hash(block_list[0], block) : 0;
 
-		file = add_non_dup(read_size, file_bytes, block, sparse, block_list, start, fragment,
-			0, fragment_buffer ? fragment_buffer->checksum : 0,
-			FALSE, TRUE, FALSE, FALSE, bl_hash);
+		file = add_non_dup(read_size, file_bytes, block, sparse,
+			block_list, start, fragment, 0, fragment_buffer ?
+			fragment_buffer->checksum : 0, FALSE, TRUE, FALSE,
+			FALSE, bl_hash);
 	} else
-		file = create_non_dup(read_size, file_bytes, block, sparse, block_list, start, fragment,
-			0, fragment_buffer ? fragment_buffer->checksum : 0,
-			FALSE, TRUE);
+		file = create_non_dup(read_size, file_bytes, block, sparse,
+			block_list, start, fragment, 0, fragment_buffer ?
+			fragment_buffer->checksum : 0, FALSE, TRUE);
 
 	cache_block_put(fragment_buffer);
 	file_count ++;
@@ -2910,12 +3084,14 @@ static struct file_info *write_file_blocks(int *status, struct dir_ent *dir_ent,
 	fragment = get_and_fill_fragment(fragment_buffer, dir_ent, TRUE);
 
 	if(duplicate_checking)
-		file = add_non_dup(read_size, file_bytes, blocks, sparse, block_list,
-			start, fragment, 0, fragment_buffer ? fragment_buffer->checksum : 0,
-			FALSE, TRUE, FALSE, FALSE, bl_hash);
+		file = add_non_dup(read_size, file_bytes, blocks, sparse,
+			block_list, start, fragment, 0, fragment_buffer ?
+			fragment_buffer->checksum : 0, FALSE, TRUE, FALSE,
+			FALSE, bl_hash);
 	else
-		file = create_non_dup(read_size, file_bytes, blocks, sparse, block_list, start, fragment,
-			0, fragment_buffer ? fragment_buffer->checksum : 0, FALSE, TRUE);
+		file = create_non_dup(read_size, file_bytes, blocks, sparse,
+			block_list, start, fragment, 0, fragment_buffer ?
+			fragment_buffer->checksum : 0, FALSE, TRUE);
 
 	cache_block_put(fragment_buffer);
 	file_count ++;
@@ -2978,7 +3154,8 @@ again:
 		ERROR_START("Failed to read file %s", pathname(dir));
 		ERROR_EXIT(", creating empty file\n");
 		file = write_file_empty(dir, NULL, dup);
-	}
+	} else if(status)
+		BAD_ERROR("Unexpected status value in write_file()");
 
 	return file;
 }
@@ -3136,6 +3313,7 @@ static struct inode_info *lookup_inode3(struct stat *buf, struct pseudo_dev *pse
 	inode->nlink = 1;
 	inode->inode_number = 0;
 	inode->dummy_root_dir = FALSE;
+	inode->xattr = NULL;
 	inode->tarfile = FALSE;
 
 	/*
@@ -3176,7 +3354,7 @@ static inline void alloc_inode_no(struct inode_info *inode, unsigned int use_thi
 }
 
 
-struct dir_info *create_dir(char *pathname, char *subpath, int depth)
+struct dir_info *create_dir(char *pathname, char *subpath, unsigned int depth)
 {
 	struct dir_info *dir;
 
@@ -3293,10 +3471,14 @@ squashfs_inode do_directory_scans(struct dir_ent *dir_ent, int progress)
 	 * If sources have been specified, then just ignore it, as sources
 	 * on the command line take precedence.
 	 */
-	if(pseudo != NULL && pseudo->names == 1 && strcmp(pseudo->name[0].name, "/") == 0)
-		pseudo = pseudo->name[0].pseudo;
+	if(pseudo != NULL && pseudo->names == 1 && strcmp(pseudo->name[0].name, "/") == 0) {
+		if(pseudo->name[0].xattr)
+			root_dir->dir_ent->inode->xattr = pseudo->name[0].xattr;
 
-	if(actions() || get_pseudo())
+		pseudo = pseudo->name[0].pseudo;
+	}
+
+	if(actions() || pseudo)
 		dir_scan2(root_dir, pseudo);
 
 	/*
@@ -3347,8 +3529,7 @@ squashfs_inode do_directory_scans(struct dir_ent *dir_ent, int progress)
 		write_destination(fd, SQUASHFS_START, 4, "\0\0\0\0");
 	}
 
-	if(!tarfile)
-		queue_put(to_reader, root_dir);
+	queue_put(to_reader, root_dir);
 
 	if(sorted)
 		sort_files_and_write(root_dir);
@@ -3394,6 +3575,12 @@ static squashfs_inode scan_single(char *pathname, int progress)
 	if(root_time_opt)
 		buf.st_mtime = root_time;
 
+	if(pseudo_override && global_uid_opt)
+		buf.st_uid = global_uid;
+
+	if(pseudo_override && global_gid_opt)
+		buf.st_gid = global_gid;
+
 	dir_ent->inode = lookup_inode(&buf);
 	dir_ent->dir = root_dir;
 	root_dir->dir_ent = dir_ent;
@@ -3436,6 +3623,12 @@ static squashfs_inode scan_encomp(int progress)
 		buf.st_mtime = root_time;
 	else
 		buf.st_mtime = time(NULL);
+	if(pseudo_override && global_uid_opt)
+		buf.st_uid = global_uid;
+
+	if(pseudo_override && global_gid_opt)
+		buf.st_gid = global_gid;
+
 	buf.st_dev = 0;
 	buf.st_ino = 0;
 	dir_ent->inode = lookup_inode(&buf);
@@ -3464,7 +3657,7 @@ squashfs_inode dir_scan(int directory, int progress)
  * Exclude actions are processed here (in contrast to the other actions)
  * because they affect what is scanned.
  */
-struct dir_info *scan1_opendir(char *pathname, char *subpath, int depth)
+struct dir_info *scan1_opendir(char *pathname, char *subpath, unsigned int depth)
 {
 	struct dir_info *dir;
 
@@ -3615,7 +3808,7 @@ static void scan1_freedir(struct dir_info *dir)
 
 static struct dir_info *dir_scan1(char *filename, char *subpath,
 	struct pathnames *paths,
-	struct dir_ent *(_readdir)(struct dir_info *), int depth)
+	struct dir_ent *(_readdir)(struct dir_info *), unsigned int depth)
 {
 	struct dir_info *dir = scan1_opendir(filename, subpath, depth);
 	struct dir_ent *dir_ent;
@@ -3626,6 +3819,12 @@ static struct dir_info *dir_scan1(char *filename, char *subpath,
 		return NULL;
 	}
 
+	if(max_depth_opt && depth > max_depth) {
+		add_excluded(dir);
+		scan1_freedir(dir);
+		return dir;
+	}
+
 	while((dir_ent = _readdir(dir))) {
 		struct dir_info *sub_dir;
 		struct stat buf;
@@ -3633,6 +3832,7 @@ static struct dir_info *dir_scan1(char *filename, char *subpath,
 		char *filename = pathname(dir_ent);
 		char *subpath = NULL;
 		char *dir_name = dir_ent->name;
+		int create_empty_directory = FALSE;
 
 		if(strcmp(dir_name, ".") == 0 || strcmp(dir_name, "..") == 0) {
 			free_dir_entry(dir_ent);
@@ -3649,9 +3849,13 @@ static struct dir_info *dir_scan1(char *filename, char *subpath,
 
 		if(one_file_system) {
 			if(buf.st_dev != cur_dev) {
-				ERROR("%s is on a different filesystem, ignored\n", filename);
-				free_dir_entry(dir_ent);
-				continue;
+				if(!S_ISDIR(buf.st_mode) || one_file_system_x) {
+					ERROR("%s is on a different filesystem, ignored\n", filename);
+					free_dir_entry(dir_ent);
+					continue;
+				}
+
+				create_empty_directory = TRUE;
 			}
 		}
 
@@ -3697,8 +3901,12 @@ static struct dir_info *dir_scan1(char *filename, char *subpath,
 			if(subpath == NULL)
 				subpath = subpathname(dir_ent);
 
-			sub_dir = dir_scan1(filename, subpath, new,
-					scan1_readdir, depth + 1);
+			if(create_empty_directory) {
+				ERROR("%s is on a different filesystem, creating empty directory\n", filename);
+				sub_dir = create_dir(filename, subpath, depth + 1);
+			} else
+				sub_dir = dir_scan1(filename, subpath, new,
+						scan1_readdir, depth + 1);
 			if(sub_dir) {
 				dir->directory_count ++;
 				add_dir_entry(dir_ent, sub_dir,
@@ -3760,37 +3968,58 @@ static struct dir_ent *scan2_readdir(struct dir_info *dir, struct dir_ent *dir_e
 
 static void dir_scan2(struct dir_info *dir, struct pseudo *pseudo)
 {
-	struct dir_ent *dir_ent = NULL;
+	struct dir_ent *dirent = NULL;
 	struct pseudo_entry *pseudo_ent;
 	struct stat buf;
 	
-	while((dir_ent = scan2_readdir(dir, dir_ent)) != NULL) {
-		struct inode_info *inode_info = dir_ent->inode;
+	while((dirent = scan2_readdir(dir, dirent)) != NULL) {
+		struct inode_info *inode_info = dirent->inode;
 		struct stat *buf = &inode_info->buf;
-		char *name = dir_ent->name;
+		char *name = dirent->name;
 
-		eval_actions(root_dir, dir_ent);
+		eval_actions(root_dir, dirent);
 
+		if(pseudo_override && global_uid_opt)
+			buf->st_uid = global_uid;
+
+		if(pseudo_override && global_gid_opt)
+			buf->st_gid = global_gid;
+			
 		if((buf->st_mode & S_IFMT) == S_IFDIR)
-			dir_scan2(dir_ent->dir, pseudo_subdir(name, pseudo));
+			dir_scan2(dirent->dir, pseudo_subdir(name, pseudo));
 	}
 
+	/*
+	 * Process pseudo modify and add (file, directory etc) definitions
+	 */
 	while((pseudo_ent = pseudo_readdir(pseudo)) != NULL) {
-		dir_ent = lookup_name(dir, pseudo_ent->name);
+		struct dir_ent *dir_ent = NULL;
+
+		if(appending && dir->depth == 1) {
+			dir_ent = lookup_name(dir, pseudo_ent->name);
+
+			if(dir_ent && dir_ent->inode->root_entry) {
+				BAD_ERROR("Pseudo files: File \"%s\" "
+					"already exists in root directory of "
+					"the\nfilesystem being appended to. "
+					"Pseudo definitions can\'t modify it "
+					"or (if directory) add files to it\n",
+					pseudo_ent->name);
+			}
+		}
+
+		if(pseudo_ent->dev == NULL)
+			continue;
+
+		if(dir_ent == NULL)
+			dir_ent = lookup_name(dir, pseudo_ent->name);
+
 		if(pseudo_ent->dev->type == 'm' || pseudo_ent->dev->type == 'M') {
 			struct stat *buf;
 			if(dir_ent == NULL) {
 				ERROR_START("Pseudo modify file \"%s\" does "
 					"not exist in source filesystem.",
 					pseudo_ent->pathname);
-				ERROR_EXIT("  Ignoring.\n");
-				continue;
-			}
-			if(dir_ent->inode->root_entry) {
-				ERROR_START("Pseudo modify file \"%s\" is a "
-					"pre-existing file in the filesystem "
-					"being appended to.  It cannot be "\
-					"modified.", pseudo_ent->pathname);
 				ERROR_EXIT("  Ignoring.\n");
 				continue;
 			}
@@ -3805,20 +4034,10 @@ static void dir_scan2(struct dir_info *dir, struct pseudo *pseudo)
 		}
 
 		if(dir_ent) {
-			if(dir_ent->inode->root_entry) {
-				ERROR_START("Pseudo file \"%s\" is a "
-					"pre-existing file in the filesystem "
-					"being appended to.",
-					pseudo_ent->pathname);
-				ERROR_EXIT("  Ignoring.\n");
-			} else {
-				ERROR_START("Pseudo file \"%s\" exists in "
-					"source filesystem \"%s\".",
-					pseudo_ent->pathname,
-					pathname(dir_ent));
-				ERROR_EXIT("\nIgnoring, exclude it (-e/-ef) to "
-					"override.\n");
-			}
+			ERROR_START("Pseudo file \"%s\" exists in source "
+				"filesystem \"%s\".", pseudo_ent->pathname,
+				pathname(dir_ent));
+			ERROR_EXIT("\nIgnoring, exclude it (-e/-ef) to override.\n");
 			continue;
 		}
 
@@ -3832,8 +4051,11 @@ static void dir_scan2(struct dir_info *dir, struct pseudo *pseudo)
 			buf.st_mtime = pseudo_ent->dev->buf->mtime;
 			buf.st_ino = pseudo_ent->dev->buf->ino;
 
-			if(pseudo_ent->dev->type == 'r')
+			if(pseudo_ent->dev->type == 'r') {
 				buf.st_size = pseudo_ent->dev->data->length;
+				if(pseudo_ent->dev->data->sparse == FALSE)
+					buf.st_blocks = (buf.st_size + 511) >> 9;
+			}
 		}
 
 		if(pseudo_ent->dev->type == 'd') {
@@ -3862,6 +4084,30 @@ static void dir_scan2(struct dir_info *dir, struct pseudo *pseudo)
 				pseudo_ent->pathname, NULL,
 				lookup_inode2(&buf, pseudo_ent->dev), dir);
 		}
+	}
+
+	/*
+	 * Process pseudo xattr definitions
+	 */
+	if(pseudo)
+		pseudo->count = 0;
+
+	while((pseudo_ent = pseudo_readdir(pseudo)) != NULL) {
+		struct dir_ent *dir_ent = NULL;
+
+		if(pseudo_ent->xattr == NULL)
+			continue;
+
+		dir_ent = lookup_name(dir, pseudo_ent->name);
+		if(dir_ent == NULL) {
+			ERROR_START("Pseudo xattr file \"%s\" does not "
+				"exist in source filesystem.",
+				pseudo_ent->pathname);
+			ERROR_EXIT("  Ignoring.\n");
+			continue;
+		}
+
+		dir_ent->inode->xattr = pseudo_ent->xattr;
 	}
 }
 
@@ -4024,7 +4270,7 @@ static void dir_scan5(struct dir_info *dir)
  */
 
 /*
- * Bottom up linked list merge sort.
+ * Instantiate bottom up linked list merge sort.
  *
  * Qsort and other O(n log n) algorithms work well with arrays but not
  * linked lists.  Merge sort another O(n log n) sort algorithm on the other hand
@@ -4032,92 +4278,14 @@ static void dir_scan5(struct dir_info *dir)
  * as sorting is not done in place), but it is ideal for linked lists because
  * it doesn't require any extra storage,
  */ 
-void sort_directory(struct dir_info *dir)
-{
-	struct dir_ent *cur, *l1, *l2, *next;
-	int len1, len2, stride = 1;
-
-	if(dir->list == NULL || dir->count < 2)
-		return;
-
-	/*
-	 * We can consider our linked-list to be made up of stride length
-	 * sublists.  Eacn iteration around this loop merges adjacent
-	 * stride length sublists into larger 2*stride sublists.  We stop
-	 * when stride becomes equal to the entire list.
-	 *
-	 * Initially stride = 1 (by definition a sublist of 1 is sorted), and
-	 * these 1 element sublists are merged into 2 element sublists,  which
-	 * are then merged into 4 element sublists and so on.
-	 */
-	do {
-		l2 = dir->list; /* head of current linked list */
-		cur = NULL; /* empty output list */
-
-		/*
-		 * Iterate through the linked list, merging adjacent sublists.
-		 * On each interation l2 points to the next sublist pair to be
-		 * merged (if there's only one sublist left this is simply added
-		 * to the output list)
-		 */
-		while(l2) {
-			l1 = l2;
-			for(len1 = 0; l2 && len1 < stride; len1 ++, l2 = l2->next);
-			len2 = stride;
-
-			/*
-			 * l1 points to first sublist.
-			 * l2 points to second sublist.
-			 * Merge them onto the output list
-			 */
-			while(len1 && l2 && len2) {
-				if(strcmp(l1->name, l2->name) <= 0) {
-					next = l1;
-					l1 = l1->next;
-					len1 --;
-				} else {
-					next = l2;
-					l2 = l2->next;
-					len2 --;
-				}
-
-				if(cur) {
-					cur->next = next;
-					cur = next;
-				} else
-					dir->list = cur = next;
-			}
-			/*
-			 * One sublist is now empty, copy the other one onto the
-			 * output list
-			 */
-			for(; len1; len1 --, l1 = l1->next) {
-				if(cur) {
-					cur->next = l1;
-					cur = l1;
-				} else
-					dir->list = cur = l1;
-			}
-			for(; l2 && len2; len2 --, l2 = l2->next) {
-				if(cur) {
-					cur->next = l2;
-					cur = l2;
-				} else
-					dir->list = cur = l2;
-			}
-		}
-		cur->next = NULL;
-		stride = stride << 1;
-	} while(stride < dir->count);
-}
-
+SORT(sort_directory, dir_ent, name, next);
 
 static void dir_scan6(struct dir_info *dir)
 {
 	struct dir_ent *dir_ent;
 	unsigned int byte_count = 0;
 
-	sort_directory(dir);
+	sort_directory(&(dir->list), dir->count);
 
 	for(dir_ent = dir->list; dir_ent; dir_ent = dir_ent->next) {
 		byte_count += strlen(dir_ent->name) +
@@ -4216,7 +4384,9 @@ static void dir_scan7(squashfs_inode *inode, struct dir_info *dir_info)
 						file->block_list,
 						file->fragment, NULL,
 						file->sparse);
-					if(duplicate_checking == FALSE) {
+					if((duplicate_checking == FALSE &&
+							!(tarfile && no_hardlinks)) ||
+							file->file_size == 0) {
 						free_fragment(file->fragment);
 						free(file->block_list);
 						free(file);
@@ -4326,6 +4496,7 @@ static void dir_scan7(squashfs_inode *inode, struct dir_info *dir_info)
 						subpathname(dir_ent), *inode);
 					break;
 			}
+			hardlnk_count ++;
 		}
 		
 		add_dir(*inode, get_inode_no(dir_ent->inode), dir_ent->name,
@@ -4389,7 +4560,7 @@ static char *walk_source(char *source, char **pathname, char **name)
 
 static struct dir_info *add_source(struct dir_info *sdir, char *source,
 		char *subpath, char *file, char **prefix,
-		struct pathnames *paths, int depth)
+		struct pathnames *paths, unsigned int depth)
 {
 	struct dir_info *sub;
 	struct dir_ent *entry;
@@ -4398,6 +4569,9 @@ static struct dir_info *add_source(struct dir_info *sdir, char *source,
 	struct stat buf;
 	char *name, *newsubpath = NULL;
 	int res;
+
+	if(max_depth_opt && depth > max_depth)
+		return NULL;
 
 	if(dir == NULL)
 		dir = create_dir("", subpath, depth);
@@ -4483,23 +4657,23 @@ static struct dir_info *add_source(struct dir_info *sdir, char *source,
 		 *   pre-existing include encompasses this source.  So nothing
 		 *   more to do.
 		 *
-		 * - Otherwise this is not the leaf of the source, or the leaf of
-		 *   the pre-existing include, so recurse continuing walking the
-		 *   source.
+		 * - Otherwise this is not the leaf of the source, or the leaf
+		 *   of the pre-existing include, so recurse continuing walking
+		 *   the source.
 		 *
 		 * For cpiostyle source handling (leaf directories are not
 		 * recursively descended)
 		 *
-		 * - If we're at the leaf of the source, then we have a pre-existing include.
-		 *   So nothing to do.
+		 * - If we're at the leaf of the source, then we have a
+		 *   pre-existing include.  So nothing to do.
 		 *
 		 * - If we're not at the leaf of the source, but we're at
 		 *   the leaf of the pre-existing include, then recurse
 		 *   walking the source.
 		 *
-		 * - Otherwise this is not the leaf of the source, or the leaf of
-		 *   the pre-existing include, so recurse continuing walking the
-		 *   source.
+		 * - Otherwise this is not the leaf of the source, or the leaf
+		 *   of the pre-existing include, so recurse continuing walking
+		 *   the source.
 		 */
 		if(source[0] == '\0') {
 			if(tarstyle && entry->dir) {
@@ -4646,6 +4820,7 @@ static struct dir_info *populate_tree(struct dir_info *dir, struct pathnames *pa
 
 static char *get_filename_from_stdin(char terminator)
 {
+	static int path_max = -1;
 	static int bytes = 0;
 	static int size = 0;
 	static char *buffer = NULL;
@@ -4653,6 +4828,20 @@ static char *get_filename_from_stdin(char terminator)
 	static char *src = NULL;
 	char *dest = filename;
 	int used = 0;
+
+	/* Get the maximum pathname size supported on this system */
+	if(path_max == -1) {
+#ifdef PATH_MAX
+		path_max = PATH_MAX;
+#else
+		path_max = pathconf(".", _PC_PATH_MAX);
+		if(path_max <= 0)
+			path_max = 4096;
+#endif
+		/* limit to no more than 64K */
+		if(path_max > 65536)
+			path_max = 65536;
+	}
 
 	if(buffer == NULL) {
 		buffer = malloc(4096);
@@ -4663,6 +4852,10 @@ static char *get_filename_from_stdin(char terminator)
 	while(1) {
 		if(bytes == 0) {
 			bytes = read_bytes(STDIN_FILENO, buffer, 4096);
+
+			if(bytes == -1)
+				BAD_ERROR("Failed to read Tar file from STDIN\n");
+
 			if(bytes == 0) {
 				if(used)
 					ERROR("Got EOF when reading filename from STDIN, ignoring\n");
@@ -4673,22 +4866,28 @@ static char *get_filename_from_stdin(char terminator)
 			src = buffer;
 		}
 
-		if(size - used == 0) {
+		if(size - used <= 1) {
+			int offset = dest - filename;
 			char *buff = realloc(filename, size += 100);
 			if(buff == NULL)
 				MEM_ERROR();
-			dest = buff + (dest - filename);
+			dest = buff + offset;
 			filename = buff;
 		}
 
-		*dest = *src++;
+		if(*src == terminator) {
+			src++;
+			bytes--;
+			break;
+		}
+
+		if(used >= (path_max - 1))
+			BAD_ERROR("Cpiostyle input filename exceeds maximum "
+				"path limit of %d bytes!\n", path_max);
+
+		*dest++ = *src++;
 		bytes --;
 		used ++;
-
-		if(*dest == terminator)
-			break;
-
-		dest++;
 	}
 
 	*dest = '\0';
@@ -4785,6 +4984,11 @@ static squashfs_inode process_source(int progress)
 			buf.st_mtime = root_time;
 		else
 			buf.st_mtime = time(NULL);
+		if(pseudo_override && global_uid_opt)
+			buf.st_uid = global_uid;
+		if(pseudo_override && global_gid_opt)
+			buf.st_gid = global_gid;
+
 		entry = create_dir_entry("", NULL, "", new);
 		entry->inode = lookup_inode(&buf);
 		entry->inode->dummy_root_dir = TRUE;
@@ -4797,6 +5001,10 @@ static squashfs_inode process_source(int progress)
 			buf.st_gid = root_gid;
 		if(root_time_opt)
 			buf.st_mtime = root_time;
+		if(pseudo_override && global_uid_opt)
+			buf.st_uid = global_uid;
+		if(pseudo_override && global_gid_opt)
+			buf.st_gid = global_gid;
 
 		entry = create_dir_entry("", NULL, pathname, new);
 		entry->inode = lookup_inode(&buf);
@@ -4826,9 +5034,6 @@ static squashfs_inode no_sources(int progress)
 	struct pseudo_entry *pseudo_ent;
 	struct pseudo *pseudo = get_pseudo();
 
-	if(appending)
-		BAD_ERROR("Pseudo files defining \"/\" cannot be used with appending\n");
-
 	if(pseudo == NULL || pseudo->names != 1 || strcmp(pseudo->name[0].name, "/") != 0) {
 		ERROR_START("Source is \"-\", but no pseudo definition for \"/\"\n");
 		ERROR_EXIT("Did you forget to specify -cpiostyle or -tar?\n");
@@ -4840,15 +5045,35 @@ static squashfs_inode no_sources(int progress)
 	/* create root directory */
 	root_dir = scan1_opendir("", "", 1);
 
+	if(appending)
+		handle_root_entries(root_dir);
+
 	/* Create root directory dir_ent and associated inode, and connect
 	 * it to the root directory dir_info structure */
 	dir_ent = create_dir_entry("", NULL, "", scan1_opendir("", "", 0));
 
 	memset(&buf, 0, sizeof(buf));
-	buf.st_mode = pseudo_ent->dev->buf->mode;
-	buf.st_uid = pseudo_ent->dev->buf->uid;
-	buf.st_gid = pseudo_ent->dev->buf->gid;
-	buf.st_mtime = pseudo_ent->dev->buf->mtime;
+
+	if(root_mode_opt)
+		buf.st_mode = root_mode | S_IFDIR;
+	else
+		buf.st_mode = pseudo_ent->dev->buf->mode;
+
+	if(root_uid_opt)
+		buf.st_uid = root_uid;
+	else
+		buf.st_uid = pseudo_ent->dev->buf->uid;
+
+	if(root_gid_opt)
+		buf.st_gid = root_gid;
+	else
+		buf.st_gid = pseudo_ent->dev->buf->gid;
+
+	if(root_time_opt)
+		buf.st_mtime = root_time;
+	else
+		buf.st_mtime = pseudo_ent->dev->buf->mtime;
+
 	buf.st_ino = pseudo_ent->dev->buf->ino;
 
 	dir_ent->inode = lookup_inode2(&buf, pseudo_ent->dev);
@@ -5024,7 +5249,15 @@ static void initialise_threads(int readq, int fragq, int bwriteq, int fwriteq,
 		BAD_ERROR("Failed to set signal mask in intialise_threads\n");
 
 	if(processors == -1) {
-#ifndef linux
+#ifdef __linux__
+		cpu_set_t cpu_set;
+		CPU_ZERO(&cpu_set);
+
+		if(sched_getaffinity(0, sizeof cpu_set, &cpu_set) == -1)
+			processors = sysconf(_SC_NPROCESSORS_ONLN);
+		else
+			processors = CPU_COUNT(&cpu_set);
+#else
 		int mib[2];
 		size_t len = sizeof(processors);
 
@@ -5041,8 +5274,6 @@ static void initialise_threads(int readq, int fragq, int bwriteq, int fwriteq,
 			ERROR_EXIT("  Defaulting to 1\n");
 			processors = 1;
 		}
-#else
-		processors = sysconf(_SC_NPROCESSORS_ONLN);
 #endif
 	}
 
@@ -5304,11 +5535,13 @@ static int excluded_match(char *name, struct pathname *path, struct pathnames **
 				FNM_PATHNAME|FNM_PERIOD|FNM_EXTMATCH) == 0;
 
 		if(match) {
-			 if(path->name[i].paths == NULL || new == NULL)
+			 if(path->name[i].paths == NULL) {
 				/* match on a leaf component, any subdirectories
 			 	* in the filesystem should be excluded */
+				free(*new);
+				*new = NULL;
 				return TRUE;
-			else
+			 } else
 				/* match on a non-leaf component, add any
 				 * subdirectories to the new set of
 				 * subdirectories to scan for this name */
@@ -5324,16 +5557,13 @@ int excluded(char *name, struct pathnames *paths, struct pathnames **new)
 {
 	int n;
 		
-	if(stickypath && excluded_match(name, stickypath, NULL))
+	if(stickypath && excluded_match(name, stickypath, new))
 		return TRUE;
 
 	for(n = 0; paths && n < paths->count; n++) {
 		int res = excluded_match(name, paths->path[n], new);
-		if(res) {
-			free(*new);
-			*new = NULL;
+		if(res)
 			return TRUE;
-		}
 	}
 
 	/*
@@ -5420,8 +5650,11 @@ static void write_recovery_data(struct squashfs_super_block *sBlk)
 	char header[] = RECOVER_ID;
 
 	if(recover == FALSE) {
-		printf("No recovery data option specified.\n");
-		printf("Skipping saving recovery file.\n\n");
+		if(!quiet) {
+			printf("No recovery data option specified.\n");
+			printf("Skipping saving recovery file.\n\n");
+		}
+
 		return;
 	}
 
@@ -5463,7 +5696,12 @@ static void write_recovery_data(struct squashfs_super_block *sBlk)
 		BAD_ERROR("Failed to write recovery file, because %s\n",
 			strerror(errno));
 
-	close(recoverfd);
+	res = close(recoverfd);
+
+	if(res == -1)
+		BAD_ERROR("Failed to close recovery file, close returned %s\n",
+				strerror(errno));
+
 	free(metadata);
 	
 	printf("Recovery file \"%s\" written\n", recovery_file);
@@ -5542,8 +5780,17 @@ static void read_recovery_data(char *recovery_file, char *destination_file)
 
 	write_destination(fd, sBlk.inode_table_start, bytes, metadata);
 
-	close(recoverfd);
-	close(fd);
+	res = close(recoverfd);
+
+	if(res == -1)
+		BAD_ERROR("Failed to close recovery file, close returned %s\n",
+				strerror(errno));
+
+	res = close(fd);
+
+	if(res == -1)
+		BAD_ERROR("Failed to close output filesystem, close returned %s\n",
+				strerror(errno));
 
 	printf("Successfully wrote recovery file \"%s\".  Exiting\n",
 		recovery_file);
@@ -5747,6 +5994,7 @@ static int get_physical_memory()
 	long long page_size = sysconf(_SC_PAGESIZE);
 	int phys_mem;
 
+#ifdef __linux__
 	if(num_pages == -1 || page_size == -1) {
 		struct sysinfo sys;
 		int res = sysinfo(&sys);
@@ -5757,6 +6005,7 @@ static int get_physical_memory()
 		num_pages = sys.totalram;
 		page_size = sys.mem_unit;
 	}
+#endif
 
 	phys_mem = num_pages * page_size >> 20;
 
@@ -5903,62 +6152,191 @@ static void check_env_var()
 
 static void print_options(FILE *stream, char *name, int total_mem)
 {
-	fprintf(stream, "SYNTAX:%s source1 source2 ...  dest [options] ", name);
-	fprintf(stream, "[-e list of exclude\ndirs/files]\n");
-	fprintf(stream, "\nFilesystem build options:\n");
-	fprintf(stream, "-tar\t\t\tread uncompressed tar file from standard in (stdin)\n");
-	fprintf(stream, "-no-strip\t\tact like tar, and do not strip leading ");
-	fprintf(stream, "directories\n\t\t\tfrom source files\n");
-	fprintf(stream, "-tarstyle\t\talternative name for -no-strip\n");
-	fprintf(stream, "-cpiostyle\t\tact like cpio, and read files from standard in (stdin)\n");
-	fprintf(stream, "-cpiostyle0\t\tlike -cpiostyle, but filenames are null terminated\n");
+	fprintf(stream, "SYNTAX:%s source1 source2 ...  FILESYSTEM [OPTIONS] ", name);
+	fprintf(stream, "[-e list of\nexclude dirs/files]\n");
+	fprintf(stream, "\nFilesystem compression options:\n");
+	fprintf(stream, "-b <block_size>\t\tset data block to <block_size>.  Default ");
+	fprintf(stream, "128 Kbytes.\n");
+	fprintf(stream, "\t\t\tOptionally a suffix of K or M can be given to ");
+	fprintf(stream, "specify\n\t\t\tKbytes or Mbytes respectively\n");
 	fprintf(stream, "-comp <comp>\t\tselect <comp> compression\n");
 	fprintf(stream, "\t\t\tCompressors available:\n");
 	display_compressors(stream, "\t\t\t", COMP_DEFAULT);
-	fprintf(stream, "-b <block_size>\t\tset data block to <block_size>.  Default ");
-	fprintf(stream, "128 Kbytes\n");
-	fprintf(stream, "\t\t\tOptionally a suffix of K or M can be given to ");
-	fprintf(stream, "specify\n\t\t\tKbytes or Mbytes respectively\n");
-	fprintf(stream, "-reproducible\t\tbuild images that are reproducible");
-	fprintf(stream, REP_STR "\n");
-	fprintf(stream, "-not-reproducible\tbuild images that are not reproducible");
-	fprintf(stream, NOREP_STR "\n");
-	fprintf(stream, "-mkfs-time <time>\tset mkfs time to <time> which is an ");
-	fprintf(stream, "unsigned int\n");
-	fprintf(stream, "-fstime <time>\t\tsynonym for mkfs-time\n");
-	fprintf(stream, "-all-time <time>\tset all inode times to <time> which is an ");
-	fprintf(stream, "unsigned int\n");
-	fprintf(stream, "-no-exports\t\tdon't make filesystem exportable via NFS (-tar default)\n");
-	fprintf(stream, "-exports\t\tmake filesystem exportable via NFS (default)\n");
-	fprintf(stream, "-no-sparse\t\tdon't detect sparse files\n");
-	fprintf(stream, "-no-xattrs\t\tdon't store extended attributes" NOXOPT_STR "\n");
-	fprintf(stream, "-xattrs\t\t\tstore extended attributes" XOPT_STR "\n");
 	fprintf(stream, "-noI\t\t\tdo not compress inode table\n");
 	fprintf(stream, "-noId\t\t\tdo not compress the uid/gid table (implied by ");
 	fprintf(stream, "-noI)\n");
 	fprintf(stream, "-noD\t\t\tdo not compress data blocks\n");
 	fprintf(stream, "-noF\t\t\tdo not compress fragment blocks\n");
 	fprintf(stream, "-noX\t\t\tdo not compress extended attributes\n");
-	fprintf(stream, "-no-tailends\t\tdon't pack tail ends into fragments (default)\n");
+	fprintf(stream, "-no-compression\t\tdo not compress any of the data ");
+	fprintf(stream, "or metadata.  This is\n\t\t\tequivalent to ");
+	fprintf(stream, "specifying -noI -noD -noF and -noX\n");
+	fprintf(stream, "\nFilesystem build options:\n");
+	fprintf(stream, "-tar\t\t\tread uncompressed tar file from standard in (stdin)\n");
+	fprintf(stream, "-no-strip\t\tact like tar, and do not strip leading ");
+	fprintf(stream, "directories\n\t\t\tfrom source files\n");
+	fprintf(stream, "-tarstyle\t\talternative name for -no-strip\n");
+	fprintf(stream, "-cpiostyle\t\tact like cpio, and read file ");
+	fprintf(stream, "pathnames from standard in\n\t\t\t(stdin)\n");
+	fprintf(stream, "-cpiostyle0\t\tlike -cpiostyle, but filenames are ");
+	fprintf(stream, "null terminated.  Can\n\t\t\tbe used with find ");
+	fprintf(stream, "-print0 action\n");
+	fprintf(stream, "-reproducible\t\tbuild filesystems that are reproducible");
+	fprintf(stream, REP_STR "\n");
+	fprintf(stream, "-not-reproducible\tbuild filesystems that are not reproducible");
+	fprintf(stream, NOREP_STR "\n");
+	fprintf(stream, "-mkfs-time <time>\tset filesystem creation ");
+	fprintf(stream, "timestamp to <time>. <time> can\n\t\t\tbe an ");
+	fprintf(stream, "unsigned 32-bit int indicating seconds since the\n");
+	fprintf(stream, "\t\t\tepoch (1970-01-01) or a string value which ");
+	fprintf(stream, "is passed to\n\t\t\tthe \"date\" command to ");
+	fprintf(stream, "parse. Any string value which the\n\t\t\tdate ");
+	fprintf(stream, "command recognises can be used such as \"now\",\n");
+	fprintf(stream, "\t\t\t\"last week\", or \"Wed Feb 15 21:02:39 ");
+	fprintf(stream, "GMT 2023\"\n");
+	fprintf(stream, "-all-time <time>\tset all file timestamps to ");
+	fprintf(stream, "<time>. <time> can be an\n\t\t\tunsigned 32-bit ");
+	fprintf(stream, "int indicating seconds since the epoch\n\t\t\t");
+	fprintf(stream, "(1970-01-01) or a string value which is passed to ");
+	fprintf(stream, "the\n\t\t\t\"date\" command to parse. Any string ");
+	fprintf(stream, "value which the date\n\t\t\tcommand recognises can ");
+	fprintf(stream, "be used such as \"now\", \"last\n\t\t\tweek\", or ");
+	fprintf(stream, "\"Wed Feb 15 21:02:39 GMT 2023\"\n");
+	fprintf(stream, "-root-time <time>\tset root directory time to ");
+	fprintf(stream, "<time>. <time> can be an\n\t\t\tunsigned 32-bit ");
+	fprintf(stream, "int indicating seconds since the epoch\n\t\t\t");
+	fprintf(stream, "(1970-01-01) or a string value which is passed to ");
+	fprintf(stream, "the\n\t\t\t\"date\" command to parse. Any string ");
+	fprintf(stream, "value which the date\n\t\t\tcommand recognises can ");
+	fprintf(stream, "be used such as \"now\", \"last\n\t\t\tweek\", or ");
+	fprintf(stream, "\"Wed Feb 15 21:02:39 GMT 2023\"\n");
+	fprintf(stream, "-root-mode <mode>\tset root directory permissions ");
+	fprintf(stream, "to octal <mode>\n");
+	fprintf(stream, "-root-uid <value>\tset root directory owner to ");
+	fprintf(stream, "specified <value>,\n\t\t\t<value> can be either an ");
+	fprintf(stream, "integer uid or user name\n");
+	fprintf(stream, "-root-gid <value>\tset root directory group to ");
+	fprintf(stream, "specified <value>,\n\t\t\t<value> can be either an ");
+	fprintf(stream, "integer gid or group name\n");
+	fprintf(stream, "-all-root\t\tmake all files owned by root\n");
+	fprintf(stream, "-force-uid <value>\tset all file uids to specified ");
+	fprintf(stream, "<value>, <value> can be\n\t\t\teither an integer ");
+	fprintf(stream, "uid or user name\n");
+	fprintf(stream, "-force-gid <value>\tset all file gids to specified ");
+	fprintf(stream, "<value>, <value> can be\n\t\t\teither an integer ");
+	fprintf(stream, "gid or group name\n");
+	fprintf(stream, "-pseudo-override\tmake pseudo file uids and gids ");
+	fprintf(stream, "override -all-root,\n\t\t\t-force-uid and ");
+	fprintf(stream, "-force-gid options\n"); 
+	fprintf(stream, "-no-exports\t\tdo not make filesystem exportable via NFS (-tar default)\n");
+	fprintf(stream, "-exports\t\tmake filesystem exportable via NFS (default)\n");
+	fprintf(stream, "-no-sparse\t\tdo not detect sparse files\n");
+	fprintf(stream, "-no-tailends\t\tdo not pack tail ends into fragments (default)\n");
 	fprintf(stream, "-tailends\t\tpack tail ends into fragments\n");
 	fprintf(stream, "-no-fragments\t\tdo not use fragments\n");
-	fprintf(stream, "-always-use-fragments\tuse fragment blocks for files larger ");
-	fprintf(stream, "than block size\n");
 	fprintf(stream, "-no-duplicates\t\tdo not perform duplicate checking\n");
 	fprintf(stream, "-no-hardlinks\t\tdo not hardlink files, instead store duplicates\n");
-	fprintf(stream, "-all-root\t\tmake all files owned by root\n");
-	fprintf(stream, "-root-time <time>\tset root directory time to <time>\n");
-	fprintf(stream, "-root-mode <mode>\tset root directory permissions to octal ");
-	fprintf(stream, "<mode>\n");
-	fprintf(stream, "-root-uid <uid>\t\tset root directory owner to <uid>\n");
-	fprintf(stream, "-root-gid <gid>\t\tset root directory group to <gid>\n");
-	fprintf(stream, "-force-uid <uid>\tset all file uids to <uid>\n");
-	fprintf(stream, "-force-gid <gid>\tset all file gids to <gid>\n");
-	fprintf(stream, "-nopad\t\t\tdo not pad filesystem to a multiple of 4K\n");
 	fprintf(stream, "-keep-as-directory\tif one source directory is specified, ");
 	fprintf(stream, "create a root\n");
 	fprintf(stream, "\t\t\tdirectory containing that directory, rather than the\n");
 	fprintf(stream, "\t\t\tcontents of the directory\n");
+	fprintf(stream, "\nFilesystem filter options:\n");
+	fprintf(stream, "-p <pseudo-definition>\tadd pseudo file ");
+	fprintf(stream, "definition.  The definition should\n");
+	fprintf(stream, "\t\t\tbe quoted\n");
+	fprintf(stream, "-pf <pseudo-file>\tadd list of pseudo file ");
+	fprintf(stream, "definitions from <pseudo-file>,\n\t\t\tuse - for ");
+	fprintf(stream, "stdin.  Pseudo file definitions should not be\n");
+	fprintf(stream, "\t\t\tquoted\n");
+	fprintf(stream, "-sort <sort_file>\tsort files according to priorities in ");
+	fprintf(stream, "<sort_file>.  One\n\t\t\tfile or dir with priority per ");
+	fprintf(stream, "line.  Priority -32768 to\n\t\t\t32767, default priority 0\n");
+	fprintf(stream, "-ef <exclude_file>\tlist of exclude dirs/files.  ");
+	fprintf(stream, "One per line\n");
+	fprintf(stream, "-wildcards\t\tallow extended shell wildcards (globbing) to be ");
+	fprintf(stream, "used in\n\t\t\texclude dirs/files\n");
+	fprintf(stream, "-regex\t\t\tallow POSIX regular expressions to be used in ");
+	fprintf(stream, "exclude\n\t\t\tdirs/files\n");
+	fprintf(stream, "-max-depth <levels>\tdescend at most <levels> of ");
+	fprintf(stream, "directories when scanning\n\t\t\tfilesystem\n");
+	fprintf(stream, "-one-file-system\tdo not cross filesystem ");
+	fprintf(stream, "boundaries.  If a directory\n\t\t\tcrosses the ");
+	fprintf(stream, "boundary, create an empty directory for\n\t\t\teach ");
+	fprintf(stream, "mount point.  If a file crosses the boundary\n\t\t\t");
+	fprintf(stream, "ignore it\n");
+	fprintf(stream, "-one-file-system-x\tdo not cross filesystem ");
+	fprintf(stream, "boundaries. Like\n\t\t\t-one-file-system option ");
+	fprintf(stream, "except directories are also\n\t\t\tignored if they ");
+	fprintf(stream, "cross the boundary\n");
+	fprintf(stream, "\nFilesystem extended attribute (xattrs) options:\n");
+	fprintf(stream, "-no-xattrs\t\tdo not store extended attributes" NOXOPT_STR "\n");
+	fprintf(stream, "-xattrs\t\t\tstore extended attributes" XOPT_STR "\n");
+	fprintf(stream, "-xattrs-exclude <regex>\texclude any xattr names ");
+	fprintf(stream, "matching <regex>.  <regex> is a\n\t\t\tPOSIX ");
+	fprintf(stream, "regular expression, e.g. -xattrs-exclude ");
+	fprintf(stream, "'^user.'\n\t\t\texcludes xattrs from the user ");
+	fprintf(stream, "namespace\n");
+	fprintf(stream, "-xattrs-include <regex>\tinclude any xattr names ");
+	fprintf(stream, "matching <regex>.  <regex> is a\n\t\t\tPOSIX ");
+	fprintf(stream, "regular expression, e.g. -xattrs-include ");
+	fprintf(stream, "'^user.'\n\t\t\tincludes xattrs from the user ");
+	fprintf(stream, "namespace\n");
+	fprintf(stream, "-xattrs-add <name=val>\tadd the xattr <name> with ");
+	fprintf(stream, "<val> to files.  If an\n\t\t\tuser xattr it ");
+	fprintf(stream, "will be added to regular files and\n");
+	fprintf(stream, "\t\t\tdirectories (see man 7 xattr).  Otherwise it ");
+	fprintf(stream, "will be\n\t\t\tadded to all files.  <val> by ");
+	fprintf(stream, "default will be treated as\n\t\t\tbinary (i.e. an ");
+	fprintf(stream, "uninterpreted byte sequence), but it can\n\t\t\tbe ");
+	fprintf(stream, "prefixed with 0s, where it will be treated as ");
+	fprintf(stream, "base64\n\t\t\tencoded, or prefixed with 0x, where ");
+	fprintf(stream, "val will be treated\n\t\t\tas hexidecimal.  ");
+	fprintf(stream, "Additionally it can be prefixed with\n\t\t\t0t ");
+	fprintf(stream, "where this encoding is similar to binary encoding,\n");
+	fprintf(stream, "\t\t\texcept backslashes are specially treated, and ");
+	fprintf(stream, "a\n\t\t\tbackslash followed by 3 octal digits can ");
+	fprintf(stream, "be used to\n\t\t\tencode any ASCII character, ");
+	fprintf(stream, "which obviously can be used\n\t\t\tto encode ");
+	fprintf(stream, "control codes.  The option can be repeated\n");
+	fprintf(stream, "\t\t\tmultiple times to add multiple xattrs\n");
+	fprintf(stream, "\nMksquashfs runtime options:\n");
+	fprintf(stream, "-version\t\tprint version, licence and copyright message\n");
+	fprintf(stream, "-exit-on-error\t\ttreat normally ignored errors as fatal\n");
+	fprintf(stream, "-quiet\t\t\tno verbose output\n");
+	fprintf(stream, "-info\t\t\tprint files written to filesystem\n");
+	fprintf(stream, "-no-progress\t\tdo not display the progress bar\n");
+	fprintf(stream, "-progress\t\tdisplay progress bar when using the -info ");
+	fprintf(stream, "option\n");
+	fprintf(stream, "-percentage\t\tdisplay a percentage rather than the ");
+	fprintf(stream, "full progress bar.\n\t\t\tCan be used with dialog ");
+	fprintf(stream, "--gauge etc.\n");
+	fprintf(stream, "-throttle <percentage>\tthrottle the I/O input rate by the ");
+	fprintf(stream, "given percentage.\n\t\t\tThis can be used to reduce the I/O ");
+	fprintf(stream, "and CPU consumption\n\t\t\tof Mksquashfs\n");
+	fprintf(stream, "-limit <percentage>\tlimit the I/O input rate to the given ");
+	fprintf(stream, "percentage.\n\t\t\tThis can be used to reduce the I/O and CPU ");
+	fprintf(stream, "consumption\n\t\t\tof Mksquashfs (alternative to -throttle)\n");
+	fprintf(stream, "-processors <number>\tuse <number> processors.  By default ");
+	fprintf(stream, "will use number of\n\t\t\tprocessors available\n");
+	fprintf(stream, "-mem <size>\t\tuse <size> physical memory for ");
+	fprintf(stream, "caches.  Use K, M or G to\n\t\t\tspecify Kbytes,");
+	fprintf(stream, " Mbytes or Gbytes respectively\n");
+	fprintf(stream, "-mem-percent <percent>\tuse <percent> physical ");
+	fprintf(stream, "memory for caches.  Default 25%%\n");
+	fprintf(stream, "-mem-default\t\tprint default memory usage in Mbytes\n");
+	fprintf(stream, "\nFilesystem append options:\n");
+	fprintf(stream, "-noappend\t\tdo not append to existing filesystem\n");
+	fprintf(stream, "-root-becomes <name>\twhen appending source ");
+	fprintf(stream, "files/directories, make the\n");
+	fprintf(stream, "\t\t\toriginal root become a subdirectory in the new root\n");
+	fprintf(stream, "\t\t\tcalled <name>, rather than adding the new source items\n");
+	fprintf(stream, "\t\t\tto the original root\n");
+	fprintf(stream, "-no-recovery\t\tdo not generate a recovery file\n");
+	fprintf(stream, "-recovery-path <name>\tuse <name> as the directory ");
+	fprintf(stream, "to store the recovery file\n");
+	fprintf(stream, "-recover <name>\t\trecover filesystem data using recovery ");
+	fprintf(stream, "file <name>\n");
+	fprintf(stream, "\nFilesystem actions options:\n");
 	fprintf(stream, "-action <action@expr>\tevaluate <expr> on every file, ");
 	fprintf(stream, "and execute <action>\n\t\t\tif it returns TRUE\n");
 	fprintf(stream, "-log-action <act@expr>\tas above, but log expression ");
@@ -5975,77 +6353,41 @@ static void print_options(FILE *stream, char *name, int total_mem)
 	fprintf(stream, "actions from <f>\n");
 	fprintf(stream, "-false-action-file <f>\tas -false-action, but read ");
 	fprintf(stream, "actions from <f>\n");
-	fprintf(stream, "\nFilesystem filter options:\n");
-	fprintf(stream, "-p <pseudo-definition>\tAdd pseudo file definition\n");
-	fprintf(stream, "-pf <pseudo-file>\tAdd list of pseudo file definitions\n");
-	fprintf(stream, "\t\t\tPseudo definitions should be of the format\n");
-	fprintf(stream, "\t\t\t\tfilename d mode uid gid\n");
-	fprintf(stream, "\t\t\t\tfilename m mode uid gid\n");
-	fprintf(stream, "\t\t\t\tfilename b mode uid gid major minor\n");
-	fprintf(stream, "\t\t\t\tfilename c mode uid gid major minor\n");
-	fprintf(stream, "\t\t\t\tfilename f mode uid gid command\n");
-	fprintf(stream, "\t\t\t\tfilename s mode uid gid symlink\n");
-	fprintf(stream, "\t\t\t\tfilename i mode uid gid [s|f]\n");
-	fprintf(stream, "\t\t\t\tfilename l filename\n");
-	fprintf(stream, "\t\t\t\tfilename L pseudo_filename\n");
-	fprintf(stream, "\t\t\t\tfilename D time mode uid gid\n");
-	fprintf(stream, "\t\t\t\tfilename M time mode uid gid\n");
-	fprintf(stream, "\t\t\t\tfilename B time mode uid gid major minor\n");
-	fprintf(stream, "\t\t\t\tfilename C time mode uid gid major minor\n");
-	fprintf(stream, "\t\t\t\tfilename F time mode uid gid command\n");
-	fprintf(stream, "\t\t\t\tfilename S time mode uid gid symlink\n");
-	fprintf(stream, "\t\t\t\tfilename I time mode uid gid [s|f]\n");
-	fprintf(stream, "\t\t\t\tfilename R time mode uid gid length offset\n");
-	fprintf(stream, "-sort <sort_file>\tsort files according to priorities in ");
-	fprintf(stream, "<sort_file>.  One\n\t\t\tfile or dir with priority per ");
-	fprintf(stream, "line.  Priority -32768 to\n\t\t\t32767, default priority 0\n");
-	fprintf(stream, "-ef <exclude_file>\tlist of exclude dirs/files.  ");
-	fprintf(stream, "One per line\n");
-	fprintf(stream, "-wildcards\t\tAllow extended shell wildcards (globbing) to be ");
-	fprintf(stream, "used in\n\t\t\texclude dirs/files\n");
-	fprintf(stream, "-regex\t\t\tAllow POSIX regular expressions to be used in ");
-	fprintf(stream, "exclude\n\t\t\tdirs/files\n");
-	fprintf(stream, "-one-file-system\tDo not cross filesystem ");
-	fprintf(stream, "boundaries when scanning sources\n");
-	fprintf(stream, "\nFilesystem append options:\n");
-	fprintf(stream, "-noappend\t\tdo not append to existing filesystem\n");
-	fprintf(stream, "-root-becomes <name>\twhen appending source ");
-	fprintf(stream, "files/directories, make the\n");
-	fprintf(stream, "\t\t\toriginal root become a subdirectory in the new root\n");
-	fprintf(stream, "\t\t\tcalled <name>, rather than adding the new source items\n");
-	fprintf(stream, "\t\t\tto the original root\n");
-	fprintf(stream, "\nMksquashfs runtime options:\n");
-	fprintf(stream, "-version\t\tprint version, licence and copyright message\n");
-	fprintf(stream, "-exit-on-error\t\ttreat normally ignored errors as fatal\n");
-	fprintf(stream, "-recover <name>\t\trecover filesystem data using recovery ");
-	fprintf(stream, "file <name>\n");
-	fprintf(stream, "-no-recovery\t\tdon't generate a recovery file\n");
-	fprintf(stream, "-recovery-path <name>\tuse <name> as the directory ");
-	fprintf(stream, "to store the recovery file\n");
-	fprintf(stream, "-quiet\t\t\tno verbose output\n");
-	fprintf(stream, "-info\t\t\tprint files written to filesystem\n");
-	fprintf(stream, "-no-progress\t\tdon't display the progress bar\n");
-	fprintf(stream, "-progress\t\tdisplay progress bar when using the -info ");
-	fprintf(stream, "option\n");
-	fprintf(stream, "-throttle <percentage>\tthrottle the I/O input rate by the ");
-	fprintf(stream, "given percentage.\n\t\t\tThis can be used to reduce the I/O ");
-	fprintf(stream, "and CPU consumption\n\t\t\tof Mksquashfs\n");
-	fprintf(stream, "-limit <percentage>\tlimit the I/O input rate to the given ");
-	fprintf(stream, "percentage.\n\t\t\tThis can be used to reduce the I/O and CPU ");
-	fprintf(stream, "consumption\n\t\t\tof Mksquashfs (alternative to -throttle)\n");
-	fprintf(stream, "-processors <number>\tUse <number> processors.  By default ");
-	fprintf(stream, "will use number of\n\t\t\tprocessors available\n");
-	fprintf(stream, "-mem <size>\t\tUse <size> physical memory.  Currently set ");
-	fprintf(stream, "to %dM\n", total_mem);
-	fprintf(stream, "\t\t\tOptionally a suffix of K, M or G can be given to ");
-	fprintf(stream, "specify\n\t\t\tKbytes, Mbytes or Gbytes respectively\n");
-	fprintf(stream, "\nMiscellaneous options:\n");
-	fprintf(stream, "-root-owned\t\talternative name for -all-root\n");
-	fprintf(stream, "-offset <offset>\tSkip <offset> bytes at the beginning of ");
-	fprintf(stream, "<dest>.\n\t\t\tOptionally a suffix of K, M or G can be given ");
+	fprintf(stream, "\nTar file only options:\n");
+	fprintf(stream, "-default-mode <mode>\ttar files often do not store ");
+	fprintf(stream, "permissions for\n\t\t\tintermediate directories.  ");
+	fprintf(stream, "This option sets the default\n\t\t\tdirectory ");
+	fprintf(stream, "permissions to octal <mode>, rather than 0755.\n");
+	fprintf(stream, "\t\t\tThis also sets the root inode mode\n");
+	fprintf(stream, "-default-uid <uid>\ttar files often do not store ");
+	fprintf(stream, "uids for intermediate\n\t\t\tdirectories.  This ");
+	fprintf(stream, "option sets the default directory\n\t\t\towner to ");
+	fprintf(stream, "<uid>, rather than the user running Mksquashfs.\n");
+	fprintf(stream, "\t\t\tThis also sets the root inode uid\n");
+	fprintf(stream, "-default-gid <gid>\ttar files often do not store ");
+	fprintf(stream, "gids for intermediate\n\t\t\tdirectories.  This ");
+	fprintf(stream, "option sets the default directory\n\t\t\tgroup to ");
+	fprintf(stream, "<gid>, rather than the group of the user\n");
+	fprintf(stream, "\t\t\trunning Mksquashfs.  This also sets the root ");
+	fprintf(stream, "inode gid\n");
+	fprintf(stream, "-ignore-zeros\t\tallow tar files to be concatenated ");
+	fprintf(stream, "together and fed to\n\t\t\tMksquashfs.  Normally a ");
+	fprintf(stream, "tarfile has two consecutive 512\n\t\t\tbyte blocks ");
+	fprintf(stream, "filled with zeros which means EOF and\n");
+	fprintf(stream, "\t\t\tMksquashfs will stop reading after the first tar ");
+	fprintf(stream, "file on\n\t\t\tencountering them. This option makes ");
+	fprintf(stream, "Mksquashfs ignore\n\t\t\tthe zero filled blocks\n");
+	fprintf(stream, "\nExpert options (these may make the filesystem unmountable):\n");
+	fprintf(stream, "-nopad\t\t\tdo not pad filesystem to a multiple of 4K\n");
+	fprintf(stream, "-offset <offset>\tskip <offset> bytes at the beginning of ");
+	fprintf(stream, "FILESYSTEM.\n\t\t\tOptionally a suffix of K, M or G can be given ");
 	fprintf(stream, "to specify\n\t\t\tKbytes, Mbytes or Gbytes respectively.\n");
-	fprintf(stream, "\t\t\tDefault 0 bytes.\n");
+	fprintf(stream, "\t\t\tDefault 0 bytes\n");
 	fprintf(stream, "-o <offset>\t\tsynonym for -offset\n");
+	fprintf(stream, "\nMiscellaneous options:\n");
+	fprintf(stream, "-fstime <time>\t\talternative name for -mkfs-time\n");
+	fprintf(stream, "-always-use-fragments\talternative name for -tailends\n");
+	fprintf(stream, "-root-owned\t\talternative name for -all-root\n");
 	fprintf(stream, "-noInodeCompression\talternative name for -noI\n");
 	fprintf(stream, "-noIdTableCompression\talternative name for -noId\n");
 	fprintf(stream, "-noDataCompression\talternative name for -noD\n");
@@ -6055,69 +6397,187 @@ static void print_options(FILE *stream, char *name, int total_mem)
 	fprintf(stream, "-h\t\t\toutput this options text to stdout\n");
 	fprintf(stream, "\n-Xhelp\t\t\tprint compressor options for selected ");
 	fprintf(stream, "compressor\n");
+	fprintf(stream, "\nPseudo file definition format:\n");;
+	fprintf(stream, "\"filename d mode uid gid\"\t\tcreate a directory\n");
+	fprintf(stream, "\"filename m mode uid gid\"\t\tmodify filename\n");
+	fprintf(stream, "\"filename b mode uid gid major minor\"\tcreate a block device\n");
+	fprintf(stream, "\"filename c mode uid gid major minor\"\tcreate a character device\n");
+	fprintf(stream, "\"filename f mode uid gid command\"\tcreate file from stdout of command\n");
+	fprintf(stream, "\"filename s mode uid gid symlink\"\tcreate a symbolic link\n");
+	fprintf(stream, "\"filename i mode uid gid [s|f]\"\t\tcreate a socket (s) or FIFO (f)\n");
+	fprintf(stream, "\"filename x name=val\"\t\t\tcreate an extended attribute\n");
+	fprintf(stream, "\"filename l linkname\"\t\t\tcreate a hard-link to linkname\n");
+	fprintf(stream, "\"filename L pseudo_filename\"\t\tsame, but link to pseudo file\n");
+	fprintf(stream, "\"filename D time mode uid gid\"\t\tcreate a directory with timestamp time\n");
+	fprintf(stream, "\"filename M time mode uid gid\"\t\tmodify a file with timestamp time\n");
+	fprintf(stream, "\"filename B time mode uid gid major minor\"\n\t\t\t\t\tcreate block device with timestamp time\n");
+	fprintf(stream, "\"filename C time mode uid gid major minor\"\n\t\t\t\t\tcreate char device with timestamp time\n");
+	fprintf(stream, "\"filename F time mode uid gid command\"\tcreate file with timestamp time\n");
+	fprintf(stream, "\"filename S time mode uid gid symlink\"\tcreate symlink with timestamp time\n");
+	fprintf(stream, "\"filename I time mode uid gid [s|f]\"\tcreate socket/fifo with timestamp time\n");
 	fprintf(stream, "\nCompressors available and compressor specific options:\n");
 	display_compressor_usage(stream, COMP_DEFAULT);
 
-	fprintf(stream, "\nThe README for the Squash-tools 4.5 release, ");
+	fprintf(stream, "\nEnvironment:\n");
+	fprintf(stream, "SOURCE_DATE_EPOCH\tIf set, this is used as the ");
+	fprintf(stream,	"filesystem creation\n");
+	fprintf(stream, "\t\t\ttimestamp.  Also any file timestamps which are\n");
+	fprintf(stream, "\t\t\tafter SOURCE_DATE_EPOCH will be clamped to\n");
+	fprintf(stream, "\t\t\tSOURCE_DATE_EPOCH.  See\n");
+	fprintf(stream, "\t\t\thttps://reproducible-builds.org/docs/source-date-epoch/\n");
+	fprintf(stream, "\t\t\tfor more information\n");
+	fprintf(stream, "\nSee also:");
+	fprintf(stream, "\nThe README for the Squashfs-tools 4.6.1 release, ");
 	fprintf(stream, "describing the new features can be\n");
-	fprintf(stream, "read here https://github.com/plougher/squashfs-tools/blob/master/README-4.5\n");
+	fprintf(stream, "read here https://github.com/plougher/squashfs-tools/blob/master/README-4.6.1\n");
 
 	fprintf(stream, "\nThe Squashfs-tools USAGE guide can be read here\n");
-	fprintf(stream, "https://github.com/plougher/squashfs-tools/blob/master/USAGE\n");
+	fprintf(stream, "https://github.com/plougher/squashfs-tools/blob/master/USAGE-4.6\n");
 	fprintf(stream, "\nThe ACTIONS-README file describing how to use the new actions feature can be\n");
-       fprintf(stream, "read here https://github.com/plougher/squashfs-tools/blob/master/ACTIONS-README\n");
+	fprintf(stream, "read here https://github.com/plougher/squashfs-tools/blob/master/ACTIONS-README\n");
 }
 
 
 static void print_sqfstar_options(FILE *stream, char *name, int total_mem)
 {
-	fprintf(stream, "SYNTAX:%s [options] image ", name);
+	fprintf(stream, "SYNTAX:%s [OPTIONS] FILESYSTEM ", name);
 	fprintf(stream, "[list of exclude dirs/files]\n");
-	fprintf(stream, "\nFilesystem build options:\n");
+	fprintf(stream, "\nFilesystem compression options:\n");
+	fprintf(stream, "-b <block_size>\t\tset data block to <block_size>.  Default ");
+	fprintf(stream, "128 Kbytes.\n");
+	fprintf(stream, "\t\t\tOptionally a suffix of K or M can be given to ");
+	fprintf(stream, "specify\n\t\t\tKbytes or Mbytes respectively\n");
 	fprintf(stream, "-comp <comp>\t\tselect <comp> compression\n");
 	fprintf(stream, "\t\t\tCompressors available:\n");
 	display_compressors(stream, "\t\t\t", COMP_DEFAULT);
-	fprintf(stream, "-b <block_size>\t\tset data block to <block_size>.  Default ");
-	fprintf(stream, "128 Kbytes\n");
-	fprintf(stream, "\t\t\tOptionally a suffix of K or M can be given to ");
-	fprintf(stream, "specify\n\t\t\tKbytes or Mbytes respectively\n");
-	fprintf(stream, "-reproducible\t\tbuild images that are reproducible");
-	fprintf(stream, REP_STR "\n");
-	fprintf(stream, "-not-reproducible\tbuild images that are not reproducible");
-	fprintf(stream, NOREP_STR "\n");
-	fprintf(stream, "-mkfs-time <time>\tset mkfs time to <time> which is an ");
-	fprintf(stream, "unsigned int\n");
-	fprintf(stream, "-fstime <time>\t\tsynonym for mkfs-time\n");
-	fprintf(stream, "-all-time <time>\tset all inode times to <time> which is an ");
-	fprintf(stream, "unsigned int\n");
-	fprintf(stream, "-exports\t\tmake the filesystem exportable via NFS\n");
-	fprintf(stream, "-no-sparse\t\tdon't detect sparse files\n");
-	fprintf(stream, "-no-xattrs\t\tdon't store extended attributes" NOXOPT_STR "\n");
-	fprintf(stream, "-xattrs\t\t\tstore extended attributes" XOPT_STR "\n");
 	fprintf(stream, "-noI\t\t\tdo not compress inode table\n");
 	fprintf(stream, "-noId\t\t\tdo not compress the uid/gid table (implied by ");
 	fprintf(stream, "-noI)\n");
 	fprintf(stream, "-noD\t\t\tdo not compress data blocks\n");
 	fprintf(stream, "-noF\t\t\tdo not compress fragment blocks\n");
 	fprintf(stream, "-noX\t\t\tdo not compress extended attributes\n");
-	fprintf(stream, "-no-fragments\t\tdo not use fragments\n");
-	fprintf(stream, "-no-tailends\t\tdon't pack tail ends into fragments\n");
-	fprintf(stream, "-no-duplicates\t\tdo not perform duplicate checking\n");
-	fprintf(stream, "-no-hardlinks\t\tdo not hardlink files, instead store duplicates\n");
-	fprintf(stream, "-all-root\t\tmake all files owned by root\n");
-	fprintf(stream, "-root-time <time>\tset root directory time to <time>\n");
+	fprintf(stream, "-no-compression\t\tdo not compress any of the data ");
+	fprintf(stream, "or metadata.  This is\n\t\t\tequivalent to ");
+	fprintf(stream, "specifying -noI -noD -noF and -noX\n");
+	fprintf(stream, "\nFilesystem build options:\n");
+	fprintf(stream, "-reproducible\t\tbuild filesystems that are reproducible");
+	fprintf(stream, REP_STR "\n");
+	fprintf(stream, "-not-reproducible\tbuild filesystems that are not reproducible");
+	fprintf(stream, NOREP_STR "\n");
+	fprintf(stream, "-mkfs-time <time>\tset filesystem creation ");
+	fprintf(stream, "timestamp to <time>. <time> can\n\t\t\tbe an ");
+	fprintf(stream, "unsigned 32-bit int indicating seconds since the\n");
+	fprintf(stream, "\t\t\tepoch (1970-01-01) or a string value which ");
+	fprintf(stream, "is passed to\n\t\t\tthe \"date\" command to ");
+	fprintf(stream, "parse. Any string value which the\n\t\t\tdate ");
+	fprintf(stream, "command recognises can be used such as \"now\",\n");
+	fprintf(stream, "\t\t\t\"last week\", or \"Wed Feb 15 21:02:39 ");
+	fprintf(stream, "GMT 2023\"\n");
+	fprintf(stream, "-all-time <time>\tset all file timestamps to ");
+	fprintf(stream, "<time>. <time> can be an\n\t\t\tunsigned 32-bit ");
+	fprintf(stream, "int indicating seconds since the epoch\n\t\t\t");
+	fprintf(stream, "(1970-01-01) or a string value which is passed to ");
+	fprintf(stream, "the\n\t\t\t\"date\" command to parse. Any string ");
+	fprintf(stream, "value which the date\n\t\t\tcommand recognises can ");
+	fprintf(stream, "be used such as \"now\", \"last\n\t\t\tweek\", or ");
+	fprintf(stream, "\"Wed Feb 15 21:02:39 GMT 2023\"\n");
+	fprintf(stream, "-root-time <time>\tset root directory time to ");
+	fprintf(stream, "<time>. <time> can be an\n\t\t\tunsigned 32-bit ");
+	fprintf(stream, "int indicating seconds since the epoch\n\t\t\t");
+	fprintf(stream, "(1970-01-01) or a string value which is passed to ");
+	fprintf(stream, "the\n\t\t\t\"date\" command to parse. Any string ");
+	fprintf(stream, "value which the date\n\t\t\tcommand recognises can ");
+	fprintf(stream, "be used such as \"now\", \"last\n\t\t\tweek\", or ");
+	fprintf(stream, "\"Wed Feb 15 21:02:39 GMT 2023\"\n");
 	fprintf(stream, "-root-mode <mode>\tset root directory permissions to octal ");
 	fprintf(stream, "<mode>\n");
-	fprintf(stream, "-root-uid <uid>\t\tset root directory owner to <uid>\n");
-	fprintf(stream, "-root-gid <gid>\t\tset root directory group to <gid>\n");
-	fprintf(stream, "-force-uid <uid>\tset all file uids to <uid>\n");
-	fprintf(stream, "-force-gid <gid>\tset all file gids to <gid>\n");
-	fprintf(stream, "-nopad\t\t\tdo not pad filesystem to a multiple of 4K\n");
+	fprintf(stream, "-root-uid <value>\tset root directory owner to ");
+	fprintf(stream, "specified <value>,\n\t\t\t<value> can be either an ");
+	fprintf(stream, "integer uid or user name\n");
+	fprintf(stream, "-root-gid <value>\tset root directory group to ");
+	fprintf(stream, "specified <value>,\n\t\t\t<value> can be either an ");
+	fprintf(stream, "integer gid or group name\n");
+	fprintf(stream, "-all-root\t\tmake all files owned by root\n");
+	fprintf(stream, "-force-uid <value>\tset all file uids to specified ");
+	fprintf(stream, "<value>, <value> can be\n\t\t\teither an integer ");
+	fprintf(stream, "uid or user name\n");
+	fprintf(stream, "-force-gid <value>\tset all file gids to specified ");
+	fprintf(stream, "<value>, <value> can be\n\t\t\teither an integer ");
+	fprintf(stream, "gid or group name\n");
+	fprintf(stream, "-default-mode <mode>\ttar files often do not store ");
+	fprintf(stream, "permissions for\n\t\t\tintermediate directories.  ");
+	fprintf(stream, "This option sets the default\n\t\t\tdirectory ");
+	fprintf(stream, "permissions to octal <mode>, rather than 0755.\n");
+	fprintf(stream, "\t\t\tThis also sets the root inode mode\n");
+	fprintf(stream, "-default-uid <uid>\ttar files often do not store ");
+	fprintf(stream, "uids for intermediate\n\t\t\tdirectories.  This ");
+	fprintf(stream, "option sets the default directory\n\t\t\towner to ");
+	fprintf(stream, "<uid>, rather than the user running Sqfstar.\n");
+	fprintf(stream, "\t\t\tThis also sets the root inode uid\n");
+	fprintf(stream, "-default-gid <gid>\ttar files often do not store ");
+	fprintf(stream, "gids for intermediate\n\t\t\tdirectories.  This ");
+	fprintf(stream, "option sets the default directory\n\t\t\tgroup to ");
+	fprintf(stream, "<gid>, rather than the group of the user\n");
+	fprintf(stream, "\t\t\trunning Sqfstar.  This also sets the root ");
+	fprintf(stream, "inode gid\n");
+	fprintf(stream, "-pseudo-override\tmake pseudo file uids and gids ");
+	fprintf(stream, "override -all-root,\n\t\t\t-force-uid and ");
+	fprintf(stream, "-force-gid options\n");
+	fprintf(stream, "-exports\t\tmake the filesystem exportable via NFS\n");
+	fprintf(stream, "-no-sparse\t\tdo not detect sparse files\n");
+	fprintf(stream, "-no-fragments\t\tdo not use fragments\n");
+	fprintf(stream, "-no-tailends\t\tdo not pack tail ends into fragments\n");
+	fprintf(stream, "-no-duplicates\t\tdo not perform duplicate checking\n");
+	fprintf(stream, "-no-hardlinks\t\tdo not hardlink files, instead store duplicates\n");
 	fprintf(stream, "\nFilesystem filter options:\n");
+	fprintf(stream, "-p <pseudo-definition>\tadd pseudo file ");
+	fprintf(stream, "definition.  The definition should\n");
+	fprintf(stream, "\t\t\tbe quoted\n");
+	fprintf(stream, "-pf <pseudo-file>\tadd list of pseudo file ");
+	fprintf(stream, "definitions.  Pseudo file\n\t\t\tdefinitions in ");
+	fprintf(stream, "pseudo-files should not be quoted\n");
 	fprintf(stream, "-ef <exclude_file>\tlist of exclude dirs/files.  ");
 	fprintf(stream, "One per line\n");
-	fprintf(stream, "-regex\t\t\tAllow POSIX regular expressions to be used in ");
+	fprintf(stream, "-regex\t\t\tallow POSIX regular expressions to be used in ");
 	fprintf(stream, "exclude\n\t\t\tdirs/files\n");
+	fprintf(stream, "-ignore-zeros\t\tallow tar files to be concatenated ");
+	fprintf(stream, "together and fed to\n\t\t\tSqfstar.  Normally a ");
+	fprintf(stream, "tarfile has two consecutive 512\n\t\t\tbyte blocks ");
+	fprintf(stream, "filled with zeros which means EOF and\n");
+	fprintf(stream, "\t\t\tSqfstar will stop reading after the first tar ");
+	fprintf(stream, "file on\n\t\t\tencountering them. This option makes ");
+	fprintf(stream, "Sqfstar ignore the\n\t\t\tzero filled blocks\n");
+	fprintf(stream, "\nFilesystem extended attribute (xattrs) options:\n");
+	fprintf(stream, "-no-xattrs\t\tdo not store extended attributes" NOXOPT_STR "\n");
+	fprintf(stream, "-xattrs\t\t\tstore extended attributes" XOPT_STR "\n");
+	fprintf(stream, "-xattrs-exclude <regex>\texclude any xattr names ");
+	fprintf(stream, "matching <regex>.  <regex> is a\n\t\t\tPOSIX ");
+	fprintf(stream, "regular expression, e.g. -xattrs-exclude ");
+	fprintf(stream, "'^user.'\n\t\t\texcludes xattrs from the user ");
+	fprintf(stream, "namespace\n");
+	fprintf(stream, "-xattrs-include <regex>\tinclude any xattr names ");
+	fprintf(stream, "matching <regex>.  <regex> is a\n\t\t\tPOSIX ");
+	fprintf(stream, "regular expression, e.g. -xattrs-include ");
+	fprintf(stream, "'^user.'\n\t\t\tincludes xattrs from the user ");
+	fprintf(stream, "namespace\n");
+	fprintf(stream, "-xattrs-add <name=val>\tadd the xattr <name> with ");
+	fprintf(stream, "<val> to files.  If an\n\t\t\tuser xattr it ");
+	fprintf(stream, "will be added to regular files and\n");
+	fprintf(stream, "\t\t\tdirectories (see man 7 xattr).  Otherwise it ");
+	fprintf(stream, "will be\n\t\t\tadded to all files.  <val> by ");
+	fprintf(stream, "default will be treated as\n\t\t\tbinary (i.e. an ");
+	fprintf(stream, "uninterpreted byte sequence), but it can\n\t\t\tbe ");
+	fprintf(stream, "prefixed with 0s, where it will be treated as ");
+	fprintf(stream, "base64\n\t\t\tencoded, or prefixed with 0x, where ");
+	fprintf(stream, "val will be treated\n\t\t\tas hexidecimal.  ");
+	fprintf(stream, "Additionally it can be prefixed with\n\t\t\t0t ");
+	fprintf(stream, "where this encoding is similar to binary encoding,\n");
+	fprintf(stream, "\t\t\texcept backslashes are specially treated, and ");
+	fprintf(stream, "a\n\t\t\tbackslash followed by 3 octal digits can ");
+	fprintf(stream, "be used to\n\t\t\tencode any ASCII character, ");
+	fprintf(stream, "which obviously can be used\n\t\t\tto encode ");
+	fprintf(stream, "control codes.  The option can be repeated\n");
+	fprintf(stream, "\t\t\tmultiple times to add multiple xattrs\n");
 	fprintf(stream, "\nSqfstar runtime options:\n");
 	fprintf(stream, "-version\t\tprint version, licence and copyright message\n");
 	fprintf(stream, "-force\t\t\tforce Sqfstar to write to block device ");
@@ -6125,28 +6585,36 @@ static void print_sqfstar_options(FILE *stream, char *name, int total_mem)
 	fprintf(stream, "-exit-on-error\t\ttreat normally ignored errors as fatal\n");
 	fprintf(stream, "-quiet\t\t\tno verbose output\n");
 	fprintf(stream, "-info\t\t\tprint files written to filesystem\n");
-	fprintf(stream, "-no-progress\t\tdon't display the progress bar\n");
+	fprintf(stream, "-no-progress\t\tdo not display the progress bar\n");
 	fprintf(stream, "-progress\t\tdisplay progress bar when using the -info ");
 	fprintf(stream, "option\n");
+	fprintf(stream, "-percentage\t\tdisplay a percentage rather than the ");
+	fprintf(stream, "full progress bar.\n\t\t\tCan be used with dialog ");
+	fprintf(stream, "--gauge etc.\n");
 	fprintf(stream, "-throttle <percentage>\tthrottle the I/O input rate by the ");
 	fprintf(stream, "given percentage.\n\t\t\tThis can be used to reduce the I/O ");
-	fprintf(stream, "and CPU consumption\n\t\t\tof Mksquashfs\n");
+	fprintf(stream, "and CPU consumption\n\t\t\tof Sqfstar\n");
 	fprintf(stream, "-limit <percentage>\tlimit the I/O input rate to the given ");
 	fprintf(stream, "percentage.\n\t\t\tThis can be used to reduce the I/O and CPU ");
-	fprintf(stream, "consumption\n\t\t\tof Mksquashfs (alternative to -throttle)\n");
-	fprintf(stream, "-processors <number>\tUse <number> processors.  By default ");
+	fprintf(stream, "consumption\n\t\t\tof Sqfstar (alternative to -throttle)\n");
+	fprintf(stream, "-processors <number>\tuse <number> processors.  By default ");
 	fprintf(stream, "will use number of\n\t\t\tprocessors available\n");
-	fprintf(stream, "-mem <size>\t\tUse <size> physical memory.  Currently set ");
-	fprintf(stream, "to %dM\n", total_mem);
-	fprintf(stream, "\t\t\tOptionally a suffix of K, M or G can be given to ");
-	fprintf(stream, "specify\n\t\t\tKbytes, Mbytes or Gbytes respectively\n");
-	fprintf(stream, "\nMiscellaneous options:\n");
-	fprintf(stream, "-root-owned\t\talternative name for -all-root\n");
-	fprintf(stream, "-offset <offset>\tSkip <offset> bytes at the beginning of ");
-	fprintf(stream, "<dest>.\n\t\t\tOptionally a suffix of K, M or G can be given ");
+	fprintf(stream, "-mem <size>\t\tuse <size> physical memory for ");
+	fprintf(stream, "caches.  Use K, M or G to\n\t\t\tspecify Kbytes,");
+	fprintf(stream, " Mbytes or Gbytes respectively\n");
+	fprintf(stream, "-mem-percent <percent>\tuse <percent> physical ");
+	fprintf(stream, "memory for caches.  Default 25%%\n");
+	fprintf(stream, "-mem-default\t\tprint default memory usage in Mbytes\n");
+	fprintf(stream, "\nExpert options (these may make the filesystem unmountable):\n");
+	fprintf(stream, "-nopad\t\t\tdo not pad filesystem to a multiple of 4K\n");
+	fprintf(stream, "-offset <offset>\tskip <offset> bytes at the beginning of ");
+	fprintf(stream, "FILESYSTEM.\n\t\t\tOptionally a suffix of K, M or G can be given ");
 	fprintf(stream, "to specify\n\t\t\tKbytes, Mbytes or Gbytes respectively.\n");
-	fprintf(stream, "\t\t\tDefault 0 bytes.\n");
+	fprintf(stream, "\t\t\tDefault 0 bytes\n");
 	fprintf(stream, "-o <offset>\t\tsynonym for -offset\n");
+	fprintf(stream, "\nMiscellaneous options:\n");
+	fprintf(stream, "-fstime <time>\t\talternative name for mkfs-time\n");
+	fprintf(stream, "-root-owned\t\talternative name for -all-root\n");
 	fprintf(stream, "-noInodeCompression\talternative name for -noI\n");
 	fprintf(stream, "-noIdTableCompression\talternative name for -noId\n");
 	fprintf(stream, "-noDataCompression\talternative name for -noD\n");
@@ -6156,22 +6624,49 @@ static void print_sqfstar_options(FILE *stream, char *name, int total_mem)
 	fprintf(stream, "-h\t\t\toutput this options text to stdout\n");
 	fprintf(stream, "\n-Xhelp\t\t\tprint compressor options for selected ");
 	fprintf(stream, "compressor\n");
+	fprintf(stream, "\nPseudo file definition format:\n");;
+	fprintf(stream, "\"filename d mode uid gid\"\t\tcreate a directory\n");
+	fprintf(stream, "\"filename m mode uid gid\"\t\tmodify filename\n");
+	fprintf(stream, "\"filename b mode uid gid major minor\"\tcreate a block device\n");
+	fprintf(stream, "\"filename c mode uid gid major minor\"\tcreate a character device\n");
+	fprintf(stream, "\"filename f mode uid gid command\"\tcreate file from stdout of command\n");
+	fprintf(stream, "\"filename s mode uid gid symlink\"\tcreate a symbolic link\n");
+	fprintf(stream, "\"filename i mode uid gid [s|f]\"\t\tcreate a socket (s) or FIFO (f)\n");
+	fprintf(stream, "\"filename x name=val\"\t\t\tcreate an extended attribute\n");
+	fprintf(stream, "\"filename l linkname\"\t\t\tcreate a hard-link to linkname\n");
+	fprintf(stream, "\"filename L pseudo_filename\"\t\tsame, but link to pseudo file\n");
+	fprintf(stream, "\"filename D time mode uid gid\"\t\tcreate a directory with timestamp time\n");
+	fprintf(stream, "\"filename M time mode uid gid\"\t\tmodify a file with timestamp time\n");
+	fprintf(stream, "\"filename B time mode uid gid major minor\"\n\t\t\t\t\tcreate block device with timestamp time\n");
+	fprintf(stream, "\"filename C time mode uid gid major minor\"\n\t\t\t\t\tcreate char device with timestamp time\n");
+	fprintf(stream, "\"filename F time mode uid gid command\"\tcreate file with timestamp time\n");
+	fprintf(stream, "\"filename S time mode uid gid symlink\"\tcreate symlink with timestamp time\n");
+	fprintf(stream, "\"filename I time mode uid gid [s|f]\"\tcreate socket/fifo with timestamp time\n");
 	fprintf(stream, "\nCompressors available and compressor specific options:\n");
 	display_compressor_usage(stream, COMP_DEFAULT);
 
-	fprintf(stream, "\nThe README for the Squash-tools 4.5 release, ");
+	fprintf(stream, "\nEnvironment:\n");
+	fprintf(stream, "SOURCE_DATE_EPOCH\tIf set, this is used as the ");
+	fprintf(stream,	"filesystem creation\n");
+	fprintf(stream, "\t\t\ttimestamp.  Also any file timestamps which are\n");
+	fprintf(stream, "\t\t\tafter SOURCE_DATE_EPOCH will be clamped to\n");
+	fprintf(stream, "\t\t\tSOURCE_DATE_EPOCH.  See\n");
+	fprintf(stream, "\t\t\thttps://reproducible-builds.org/docs/source-date-epoch/\n");
+	fprintf(stream, "\t\t\tfor more information\n");
+	fprintf(stream, "\nSee also:\n");
+	fprintf(stream, "The README for the Squashfs-tools 4.6.1 release, ");
 	fprintf(stream, "describing the new features can be\n");
-	fprintf(stream, "read here https://github.com/plougher/squashfs-tools/blob/master/README-4.5\n");
+	fprintf(stream, "read here https://github.com/plougher/squashfs-tools/blob/master/README-4.6.1\n");
 
 	fprintf(stream, "\nThe Squashfs-tools USAGE guide can be read here\n");
-	fprintf(stream, "https://github.com/plougher/squashfs-tools/blob/master/USAGE\n");
+	fprintf(stream, "https://github.com/plougher/squashfs-tools/blob/master/USAGE-4.6\n");
 }
 
 
 static void print_version(char *string)
 {
 	printf("%s version " VERSION " (" DATE ")\n", string);
-	printf("copyright (C) 2021 Phillip Lougher ");
+	printf("copyright (C) " YEAR " Phillip Lougher ");
 	printf("<phillip@squashfs.org.uk>\n\n");
 	printf("This program is free software; you can redistribute it and/or\n");
 	printf("modify it under the terms of the GNU General Public License\n");
@@ -6235,6 +6730,7 @@ static void print_summary()
 	printf("Number of fifo nodes %u\n", fifo_count);
 	printf("Number of socket nodes %u\n", sock_count);
 	printf("Number of directories %u\n", dir_count);
+	printf("Number of hard-links %lld\n", hardlnk_count);
 	printf("Number of ids (unique uids + gids) %d\n", id_count);
 	printf("Number of uids %d\n", uid_count);
 
@@ -6269,7 +6765,60 @@ int option_with_arg(char *string, char *table[])
 		if(strcmp(string + 1, table[i]) == 0)
 			break;
 
-	return table[i] != NULL;
+	if(table[i] != NULL)
+		return TRUE;
+
+	return compressor_option_args(comp, string);
+}
+
+
+static int get_uid_from_arg(char *arg, unsigned int *uid)
+{
+	char *last;
+	long long res;
+
+	res = strtoll(arg, &last, 10);
+	if(*last == '\0') {
+		if(res < 0 || res > (((long long) 1 << 32) - 1))
+			return -2;
+
+		*uid = res;
+		return 0;
+	} else {
+		struct passwd *id = getpwnam(arg);
+
+		if(id) {
+			*uid = id->pw_uid;
+			return 0;
+		}
+	}
+
+	return -1;
+}
+
+
+static int get_gid_from_arg(char *arg, unsigned int *gid)
+{
+	char *last;
+	long long res;
+
+	res = strtoll(arg, &last, 10);
+	if(*last == '\0') {
+		if(res < 0 || res > (((long long) 1 << 32) - 1))
+			return -2;
+
+		*gid = res;
+		return 0;
+	} else {
+		struct group *id = getgrnam(arg);
+
+		if(id) {
+			*gid = id->gr_gid;
+			return 0;
+		}
+	}
+
+	return -1;
 }
 
 
@@ -6277,7 +6826,6 @@ int sqfstar(int argc, char *argv[])
 {
 	struct stat buf;
 	int res, i;
-	char *b;
 	squashfs_inode inode;
 	int readq;
 	int fragq;
@@ -6304,15 +6852,25 @@ int sqfstar(int argc, char *argv[])
 		exit(0);
 	}
 
+	if(argc == 2 && strcmp(argv[1], "-mem-default") == 0) {
+		printf("%d\n", total_mem);
+		exit(0);
+	}
+
+	comp = lookup_compressor(COMP_DEFAULT);
+
 	/*
-	 * Scan the command line for -comp xxx option, this is to ensure
-	 * any -X compressor specific options are passed to the
-	 * correct compressor
+	 * Scan the command line for -comp xxx option, this should occur before
+	 * any -X compression specific options to ensure these options are passed
+	 * to the correct compressor
 	 */
 	for(i = 1; i < argc; i++) {
-		struct compressor *prev_comp = comp;
+		if(strncmp(argv[i], "-X", 2) == 0)
+			X_opt_parsed = 1;
 
 		if(strcmp(argv[i], "-comp") == 0) {
+			struct compressor *prev_comp = comp;
+
 			if(++i == argc) {
 				ERROR("%s: -comp missing compression type\n",
 					argv[0]);
@@ -6326,7 +6884,7 @@ int sqfstar(int argc, char *argv[])
 				display_compressors(stderr, "", COMP_DEFAULT);
 				exit(1);
 			}
-			if(prev_comp != NULL && prev_comp != comp) {
+			if(compressor_opt_parsed) {
 				ERROR("%s: -comp multiple conflicting -comp"
 					" options specified on command line"
 					", previously %s, now %s\n", argv[0],
@@ -6334,7 +6892,11 @@ int sqfstar(int argc, char *argv[])
 				exit(1);
 			}
 			compressor_opt_parsed = 1;
-
+			if(X_opt_parsed) {
+				ERROR("%s: -comp option should be before any "
+					"-X option\n", argv[0]);
+				exit(1);
+			}
 		} else if(argv[i][0] != '-')
 			break;
 		else if(option_with_arg(argv[i], sqfstar_option_table))
@@ -6364,16 +6926,10 @@ int sqfstar(int argc, char *argv[])
 	 * has no such issues */
 	always_use_fragments = TRUE;
 
-	/*
-	 * if no -comp option specified lookup default compressor.  Note the
-	 * Makefile ensures the default compressor has been built, and so we
-	 * don't need to to check for failure here
-	 */
-	if(comp == NULL)
-		comp = lookup_compressor(COMP_DEFAULT);
-
 	for(i = 1; i < dest_index; i++) {
-		if(strcmp(argv[i], "-no-hardlinks") == 0)
+		if(strcmp(argv[i], "-ignore-zeros") == 0)
+			ignore_zeros = TRUE;
+		else if(strcmp(argv[i], "-no-hardlinks") == 0)
 			no_hardlinks = TRUE;
 		else if(strcmp(argv[i], "-throttle") == 0) {
 			if((++i == dest_index) || !parse_num(argv[i], &sleep_time)) {
@@ -6403,7 +6959,8 @@ int sqfstar(int argc, char *argv[])
 		} else if(strcmp(argv[i], "-mkfs-time") == 0 ||
 				strcmp(argv[i], "-fstime") == 0) {
 			if((++i == dest_index) ||
-				!parse_num_unsigned(argv[i], &mkfs_time)) {
+				(!parse_num_unsigned(argv[i], &mkfs_time) &&
+				!exec_date(argv[i], &mkfs_time))) {
 					ERROR("%s: %s missing or invalid time "
 						"value\n", argv[0],
 						argv[i - 1]);
@@ -6412,7 +6969,8 @@ int sqfstar(int argc, char *argv[])
 			mkfs_time_opt = TRUE;
 		} else if(strcmp(argv[i], "-all-time") == 0) {
 			if((++i == dest_index) ||
-				!parse_num_unsigned(argv[i], &all_time)) {
+				(!parse_num_unsigned(argv[i], &all_time) &&
+				!exec_date(argv[i], &all_time))) {
 					ERROR("%s: %s missing or invalid time "
 						"value\n", argv[0],
 						argv[i - 1]);
@@ -6432,26 +6990,74 @@ int sqfstar(int argc, char *argv[])
 			}
 			root_mode_opt = TRUE;
 		} else if(strcmp(argv[i], "-root-uid") == 0) {
-			if((++i == argc) || !parse_num_unsigned(argv[i], &root_uid)) {
-				ERROR("%s: -root-uid missing or invalid uid\n",
+			if(++i == dest_index) {
+				ERROR("%s: -root-uid missing uid or user name\n",
 					argv[0]);
+				exit(1);
+			}
+
+			res = get_uid_from_arg(argv[i], &root_uid);
+			if(res) {
+				if(res == -2)
+					ERROR("%s: -root-uid uid out of range\n",
+						argv[0]);
+				else
+					ERROR("%s: -root-uid invalid uid or "
+						"unknown user name\n", argv[0]);
 				exit(1);
 			}
 			root_uid_opt = TRUE;
 		} else if(strcmp(argv[i], "-root-gid") == 0) {
-			if((++i == argc) || !parse_num_unsigned(argv[i], &root_gid)) {
-				ERROR("%s: -root-gid missing or invalid gid\n",
+			if(++i == dest_index) {
+				ERROR("%s: -root-gid missing gid or group name\n",
 					argv[0]);
+				exit(1);
+			}
+
+			res = get_gid_from_arg(argv[i], &root_gid);
+			if(res) {
+				if(res == -2)
+					ERROR("%s: -root-gid gid out of range\n",
+						argv[0]);
+				else
+					ERROR("%s: -root-gid invalid gid or "
+						"unknown group name\n", argv[0]);
 				exit(1);
 			}
 			root_gid_opt = TRUE;
 		} else if(strcmp(argv[i], "-root-time") == 0) {
-			if((++i == argc) || !parse_num_unsigned(argv[i], &root_time)) {
+			if((++i == argc) ||
+					(!parse_num_unsigned(argv[i], &root_time) &&
+					!exec_date(argv[i], &root_time))) {
 				ERROR("%s: -root-time missing or invalid time\n",
 					argv[0]);
 				exit(1);
 			}
 			root_time_opt = TRUE;
+		} else if(strcmp(argv[i], "-default-mode") == 0) {
+			if((++i == dest_index) || !parse_mode(argv[i], &default_mode)) {
+				ERROR("%s: -default-mode missing or invalid mode,"
+					" octal number <= 07777 expected\n", argv[0]);
+				exit(1);
+			}
+			root_mode = default_mode;
+			default_mode_opt = root_mode_opt = TRUE;
+		} else if(strcmp(argv[i], "-default-uid") == 0) {
+			if((++i == dest_index) || !parse_num_unsigned(argv[i], &default_uid)) {
+				ERROR("%s: -default-uid missing or invalid uid\n",
+					argv[0]);
+				exit(1);
+			}
+			root_uid = default_uid;
+			default_uid_opt = root_uid_opt = TRUE;
+		} else if(strcmp(argv[i], "-default-gid") == 0) {
+			if((++i == dest_index) || !parse_num_unsigned(argv[i], &default_gid)) {
+				ERROR("%s: -default-gid missing or invalid gid\n",
+					argv[0]);
+				exit(1);
+			}
+			root_gid = default_gid;
+			default_gid_opt = root_gid_opt = TRUE;
 		} else if(strcmp(argv[i], "-comp") == 0)
 			/* parsed previously */
 			i++;
@@ -6469,7 +7075,9 @@ int sqfstar(int argc, char *argv[])
 						argv[i]);
 					if(!compressor_opt_parsed)
 						ERROR("%s: Did you forget to"
-							" specify -comp?\n",
+							" specify -comp, or "
+							"specify it after the"
+							" -X options?\n",
 							argv[0]);
 print_sqfstar_compressor_options:
 					ERROR("%s: selected compressor \"%s\""
@@ -6483,6 +7091,21 @@ print_sqfstar_compressor_options:
 			}
 			i += args;
 
+		} else if(strcmp(argv[i], "-pf") == 0) {
+			if(++i == dest_index) {
+				ERROR("%s: -pf missing filename\n", argv[0]);
+				exit(1);
+			}
+			if(read_pseudo_file(argv[i], argv[dest_index]) == FALSE)
+				exit(1);
+		} else if(strcmp(argv[i], "-p") == 0) {
+			if(++i == dest_index) {
+				ERROR("%s: -p missing pseudo file definition\n",
+					argv[0]);
+				exit(1);
+			}
+			if(read_pseudo_definition(argv[i], argv[dest_index]) == FALSE)
+				exit(1);
 		} else if(strcmp(argv[i], "-regex") == 0)
 			use_regex = TRUE;
 		else if(strcmp(argv[i], "-no-sparse") == 0)
@@ -6540,6 +7163,50 @@ print_sqfstar_compressor_options:
 			}
 			calculate_queue_sizes(total_mem, &readq, &fragq,
 				&bwriteq, &fwriteq);
+		} else if(strcmp(argv[i], "-mem-percent") == 0) {
+			int percent, phys_mem;
+
+			/*
+			 * Percentage of 75% and larger is dealt with later.
+			 * In the same way a fixed mem size if more than 75%
+			 * of memory is dealt with later.
+			 */
+			if((++i == dest_index) ||
+					!parse_number(argv[i], &percent, 1) ||
+					(percent < 1)) {
+				ERROR("%s: -mem-percent missing or invalid "
+					"percentage: it should be 1 - 75%\n",
+					 argv[0]);
+				exit(1);
+			}
+
+			phys_mem = get_physical_memory();
+
+			if(phys_mem == 0) {
+				ERROR("%s: -mem-percent unable to get physical "
+					"memory, use -mem instead\n", argv[0]);
+				exit(1);
+			}
+
+			if(multiply_overflow(phys_mem, percent)) {
+				ERROR("%s: -mem-percent requested phys mem too "
+					"large\n", argv[0]);
+				exit(1);
+			}
+
+			total_mem = phys_mem * percent / 100;
+
+			if(total_mem < (SQUASHFS_LOWMEM / SQUASHFS_TAKE)) {
+				ERROR("%s: -mem-percent mem too small, should "
+					"be %d Mbytes or larger\n", argv[0],
+					SQUASHFS_LOWMEM / SQUASHFS_TAKE);
+				exit(1);
+			}
+			calculate_queue_sizes(total_mem, &readq, &fragq,
+				&bwriteq, &fwriteq);
+		} else if(strcmp(argv[i], "-mem-default") == 0) {
+			printf("%d\n", total_mem);
+			exit(0);
 		} else if(strcmp(argv[i], "-b") == 0) {
 			if(++i == dest_index) {
 				ERROR("%s: -b missing block size\n", argv[0]);
@@ -6570,56 +7237,48 @@ print_sqfstar_compressor_options:
 			always_use_fragments = FALSE;
 
 		else if(strcmp(argv[i], "-all-root") == 0 ||
-				strcmp(argv[i], "-root-owned") == 0)
+				strcmp(argv[i], "-root-owned") == 0) {
 			global_uid = global_gid = 0;
-
-		else if(strcmp(argv[i], "-force-uid") == 0) {
+			global_uid_opt = global_gid_opt = TRUE;
+		} else if(strcmp(argv[i], "-force-uid") == 0) {
 			if(++i == dest_index) {
-				ERROR("%s: -force-uid missing uid or user\n",
+				ERROR("%s: -force-uid missing uid or user name\n",
 					argv[0]);
 				exit(1);
 			}
-			if((global_uid = strtoll(argv[i], &b, 10)), *b =='\0') {
-				if(global_uid < 0 || global_uid >
-						(((long long) 1 << 32) - 1)) {
-					ERROR("%s: -force-uid uid out of range"
-						"\n", argv[0]);
-					exit(1);
-				}
-			} else {
-				struct passwd *uid = getpwnam(argv[i]);
-				if(uid)
-					global_uid = uid->pw_uid;
-				else {
+
+			res = get_uid_from_arg(argv[i], &global_uid);
+			if(res) {
+				if(res == -2)
+					ERROR("%s: -force-uid uid out of range\n",
+						argv[0]);
+				else
 					ERROR("%s: -force-uid invalid uid or "
-						"unknown user\n", argv[0]);
-					exit(1);
-				}
+						"unknown user name\n", argv[0]);
+				exit(1);
 			}
+			global_uid_opt = TRUE;
 		} else if(strcmp(argv[i], "-force-gid") == 0) {
 			if(++i == dest_index) {
-				ERROR("%s: -force-gid missing gid or group\n",
+				ERROR("%s: -force-gid missing gid or group name\n",
 					argv[0]);
 				exit(1);
 			}
-			if((global_gid = strtoll(argv[i], &b, 10)), *b =='\0') {
-				if(global_gid < 0 || global_gid >
-						(((long long) 1 << 32) - 1)) {
+
+			res = get_gid_from_arg(argv[i], &global_gid);
+			if(res) {
+				if(res == -2)
 					ERROR("%s: -force-gid gid out of range"
 						"\n", argv[0]);
-					exit(1);
-				}
-			} else {
-				struct group *gid = getgrnam(argv[i]);
-				if(gid)
-					global_gid = gid->gr_gid;
-				else {
+				else
 					ERROR("%s: -force-gid invalid gid or "
-						"unknown group\n", argv[0]);
-					exit(1);
-				}
+						"unknown group name\n", argv[0]);
+				exit(1);
 			}
-		} else if(strcmp(argv[i], "-noI") == 0 ||
+			global_gid_opt = TRUE;
+		} else if(strcmp(argv[i], "-pseudo-override") == 0)
+			pseudo_override = TRUE;
+		else if(strcmp(argv[i], "-noI") == 0 ||
 				strcmp(argv[i], "-noInodeCompression") == 0)
 			noI = TRUE;
 
@@ -6639,16 +7298,67 @@ print_sqfstar_compressor_options:
 				strcmp(argv[i], "-noXattrCompression") == 0)
 			noX = TRUE;
 
-		else if(strcmp(argv[i], "-no-xattrs") == 0)
+		else if(strcmp(argv[i], "-no-compression") == 0)
+			noI = noD = noF = noX = TRUE;
+
+		else if(strcmp(argv[i], "-no-xattrs") == 0) {
+			if(xattr_exclude_preg || xattr_include_preg ||
+							add_xattrs()) {
+				ERROR("%s: -no-xattrs should not be used in "
+					"combination with -xattrs-* options\n",
+					argv[0]);
+				exit(1);
+			}
+
 			no_xattrs = TRUE;
 
-		else if(strcmp(argv[i], "-xattrs") == 0) {
+		} else if(strcmp(argv[i], "-xattrs") == 0) {
 			if(xattrs_supported())
 				no_xattrs = FALSE;
 			else {
 				ERROR("%s: xattrs are unsupported in "
 					"this build\n", argv[0]);
 				exit(1);
+			}
+
+		} else if(strcmp(argv[i], "-xattrs-exclude") == 0) {
+			if(!xattrs_supported()) {
+				ERROR("%s: xattrs are unsupported in "
+					"this build\n", argv[0]);
+				exit(1);
+			} else if(++i == dest_index) {
+				ERROR("%s: -xattrs-exclude missing regex pattern\n",
+					argv[0]);
+				exit(1);
+			} else {
+				xattr_exclude_preg = xattr_regex(argv[i], "exclude");
+				no_xattrs = FALSE;
+			}
+		} else if(strcmp(argv[i], "-xattrs-include") == 0) {
+			if(!xattrs_supported()) {
+				ERROR("%s: xattrs are unsupported in "
+					"this build\n", argv[0]);
+				exit(1);
+			} else if(++i == dest_index) {
+				ERROR("%s: -xattrs-include missing regex pattern\n",
+					argv[0]);
+				exit(1);
+			} else {
+				xattr_include_preg = xattr_regex(argv[i], "include");
+				no_xattrs = FALSE;
+			}
+		} else if(strcmp(argv[i], "-xattrs-add") == 0) {
+			if(!xattrs_supported()) {
+				ERROR("%s: xattrs are unsupported in "
+					"this build\n", argv[0]);
+				exit(1);
+			} else if(++i == dest_index) {
+				ERROR("%s: -xattrs-add missing xattr argument\n",
+					argv[0]);
+				exit(1);
+			} else {
+				xattrs_add(argv[i]);
+				no_xattrs = FALSE;
 			}
 
 		} else if(strcmp(argv[i], "-nopad") == 0)
@@ -6658,7 +7368,7 @@ print_sqfstar_compressor_options:
 			silent = FALSE;
 
 		else if(strcmp(argv[i], "-force") == 0)
-			delete = TRUE;
+			appending = FALSE;
 
 		else if(strcmp(argv[i], "-quiet") == 0)
 			quiet = TRUE;
@@ -6666,7 +7376,11 @@ print_sqfstar_compressor_options:
 		else if(strcmp(argv[i], "-exit-on-error") == 0)
 			exit_on_error = TRUE;
 
-		else if(strcmp(argv[i], "-version") == 0) {
+		else if(strcmp(argv[i], "-percentage") == 0) {
+			progressbar_percentage();
+			progress = silent = TRUE;
+
+		} else if(strcmp(argv[i], "-version") == 0) {
 			print_version("sqfstar");
 		} else {
 			ERROR("%s: invalid option\n\n", argv[0]);
@@ -6700,6 +7414,20 @@ print_sqfstar_compressor_options:
 	if(!silent)
 		progress = force_progress;
 
+	/*
+	 * Sort all the xattr-add options now they're all processed
+	 */
+	sort_xattr_add_list();
+
+	/*
+	 * If -pseudo-override option has been specified and there are
+	 * no pseudo files then reset option.  -pseudo-override relies
+	 * on dir_scan2() being run, which won't be if there's no
+	 * actions or pseudo files
+	 */
+	if(pseudo_override && !get_pseudo())
+		pseudo_override = FALSE;
+
 #ifdef SQUASHFS_TRACE
 	/*
 	 * Disable progress bar if full debug tracing is enabled.
@@ -6712,15 +7440,15 @@ print_sqfstar_compressor_options:
 	destination_file =  argv[dest_index];
 	if(stat(destination_file, &buf) == -1) {
 		if(errno == ENOENT) { /* Does not exist */
+			appending = FALSE;
 			fd = open(destination_file, O_CREAT | O_TRUNC | O_RDWR,
 				S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
 			if(fd == -1) {
 				perror("Could not create destination file");
 				exit(1);
 			}
-			delete = TRUE;
 
-			/* ensure Mksquashfs doesn't try to read
+			/* ensure Sqfstar doesn't try to read
 			 * the destination file as input, which
 			 * will result in an I/O loop */
 			if(stat(destination_file, &buf) == -1) {
@@ -6740,7 +7468,7 @@ print_sqfstar_compressor_options:
 			exit(1);
 		}
 
-		if(tarfile && !delete) {
+		if(appending) {
 			ERROR("Appending is not supported reading tar files\n");
 			ERROR("To force Sqfstar to write to this %s "
 				"use -force\n", S_ISBLK(buf.st_mode) ?
@@ -6763,7 +7491,7 @@ print_sqfstar_compressor_options:
 					"writing as destination");
 				exit(1);
 			}
-			/* ensure Mksquashfs doesn't try to read
+			/* ensure Sqfstar doesn't try to read
 			 * the destination file as input, which
 			 * will result in an I/O loop */
 			ADD_ENTRY(buf);
@@ -6788,7 +7516,7 @@ print_sqfstar_compressor_options:
 	for(i = dest_index + 1; i < argc; i++)
 		add_exclude(argv[i]);
 
-	initialise_threads(readq, fragq, bwriteq, fwriteq, delete,
+	initialise_threads(readq, fragq, bwriteq, fwriteq, !appending,
 		destination_file);
 
 	res = compressor_init(comp, &stream, SQUASHFS_METADATA_SIZE, 0);
@@ -6882,7 +7610,11 @@ print_sqfstar_compressor_options:
 		write_destination(fd, bytes, 4096 - i, temp);
 	}
 
-	close(fd);
+	res = close(fd);
+
+	if(res == -1)
+		BAD_ERROR("Failed to close output filesystem, close returned %s\n",
+				strerror(errno));
 
 	if(recovery_file)
 		unlink(recovery_file);
@@ -6901,7 +7633,7 @@ int main(int argc, char *argv[])
 {
 	struct stat buf, source_buf;
 	int res, i;
-	char *b, *root_name = NULL;
+	char *root_name = NULL;
 	squashfs_inode inode;
 	int readq;
 	int fragq;
@@ -6914,7 +7646,8 @@ int main(int argc, char *argv[])
 	char *command;
 
 	/* skip leading path components in invocation command */
-	for(command = argv[0] + strlen(argv[0]) - 1; command >= argv[0] && command[0] != '/'; command--);
+	for(command = argv[0] + strlen(argv[0]) - 1;
+			command >= argv[0] && command[0] != '/'; command--);
 
 	if(command < argv[0])
 		command = argv[0];
@@ -6932,10 +7665,17 @@ int main(int argc, char *argv[])
 	block_log = slog(block_size);
 	calculate_queue_sizes(total_mem, &readq, &fragq, &bwriteq, &fwriteq);
 
-        for(i = 1; i < argc && (argv[i][0] != '-' || strcmp(argv[i], "-") == 0); i++);
+        for(i = 1; i < argc && (argv[i][0] != '-' || strcmp(argv[i], "-") == 0);
+									i++);
 
-	if(i < argc && (strcmp(argv[i], "-help") == 0 || strcmp(argv[i], "-h") == 0)) {
+	if(i < argc && (strcmp(argv[i], "-help") == 0 ||
+						strcmp(argv[i], "-h") == 0)) {
 		print_options(stdout, argv[0], total_mem);
+		exit(0);
+	}
+
+	if(i < argc && strcmp(argv[i], "-mem-default") == 0) {
+		printf("%d\n", total_mem);
 		exit(0);
 	}
 
@@ -7000,13 +7740,50 @@ int main(int argc, char *argv[])
 	if(comp == NULL)
 		comp = lookup_compressor(COMP_DEFAULT);
 
+	/*
+	 * Scan the command line for -cpiostyle, -tar and -pf xxx options, this
+	 * is to ensure only one thing is trying to read from stdin
+	 */
 	for(i = option_offset; i < argc; i++) {
-		if(strcmp(argv[i], "-tar") == 0) {
+		if(strcmp(argv[i], "-cpiostyle") == 0)
+			cpiostyle = TRUE;
+		else if(strcmp(argv[i], "-cpiostyle0") == 0) {
+			cpiostyle = TRUE;
+			filename_terminator = '\0';
+		} else if(strcmp(argv[i], "-tar") == 0) {
 			tarfile = TRUE;
 			always_use_fragments = TRUE;
-			exportable = FALSE;
-		} else if(strcmp(argv[i], "-one-file-system") == 0)
+		} else if(strcmp(argv[i], "-pf") == 0) {
+			if(++i == argc) {
+				ERROR("%s: -pf missing filename\n", argv[0]);
+				exit(1);
+			}
+			if(strcmp(argv[i], "-") == 0)
+				pseudo_stdin = TRUE;
+		} else if(strcmp(argv[i], "-e") == 0)
+			break;
+		else if(option_with_arg(argv[i], option_table))
+			i++;
+	}
+
+	/*
+	 * Only one of cpiostyle, tar and pseudo file reading from stdin can
+	 * be specified
+	 */
+	if((!cpiostyle || tarfile || pseudo_stdin) &&
+				(!tarfile || cpiostyle || pseudo_stdin) &&
+				(!pseudo_stdin || cpiostyle || tarfile) &&
+				(cpiostyle || tarfile || pseudo_stdin))
+		BAD_ERROR("Only one of cpiostyle, tar file or pseudo file "
+				"reading from stdin can be specified\n");
+
+	for(i = option_offset; i < argc; i++) {
+		if(strcmp(argv[i], "-ignore-zeros") == 0)
+			ignore_zeros = TRUE;
+		if(strcmp(argv[i], "-one-file-system") == 0)
 			one_file_system = TRUE;
+		else if(strcmp(argv[i], "-one-file-system-x") == 0)
+			one_file_system = one_file_system_x = TRUE;
 		else if(strcmp(argv[i], "-recovery-path") == 0) {
 			if(++i == argc) {
 				ERROR("%s: -recovery-path missing pathname\n",
@@ -7014,7 +7791,8 @@ int main(int argc, char *argv[])
 				exit(1);
 			}
 			recovery_pathname = argv[i];
-		} else if(strcmp(argv[i], "-help") == 0 || strcmp(argv[i], "-h") == 0) {
+		} else if(strcmp(argv[i], "-help") == 0 ||
+						strcmp(argv[i], "-h") == 0) {
 			print_options(stdout, argv[0], total_mem);
 			exit(0);
 		} else if(strcmp(argv[i], "-no-hardlinks") == 0)
@@ -7022,11 +7800,12 @@ int main(int argc, char *argv[])
 		else if(strcmp(argv[i], "-no-strip") == 0 ||
 					strcmp(argv[i], "-tarstyle") == 0)
 			tarstyle = TRUE;
-		else if(strcmp(argv[i], "-cpiostyle") == 0)
-			cpiostyle = TRUE;
-		else if(strcmp(argv[i], "-cpiostyle0") == 0) {
-			cpiostyle = TRUE;
-			filename_terminator = '\0';
+		else if(strcmp(argv[i], "-max-depth") == 0) {
+			if((++i == argc) || !parse_num_unsigned(argv[i], &max_depth)) {
+				ERROR("%s: %s missing or invalid value\n",
+							argv[0], argv[i - 1]);
+				exit(1);
+			}
 		} else if(strcmp(argv[i], "-throttle") == 0) {
 			if((++i == argc) || !parse_num(argv[i], &sleep_time)) {
 				ERROR("%s: %s missing or invalid value\n",
@@ -7055,7 +7834,8 @@ int main(int argc, char *argv[])
 		} else if(strcmp(argv[i], "-mkfs-time") == 0 ||
 				strcmp(argv[i], "-fstime") == 0) {
 			if((++i == argc) ||
-				!parse_num_unsigned(argv[i], &mkfs_time)) {
+				(!parse_num_unsigned(argv[i], &mkfs_time) &&
+				!exec_date(argv[i], &mkfs_time))) {
 					ERROR("%s: %s missing or invalid time "
 						"value\n", argv[0],
 						argv[i - 1]);
@@ -7064,7 +7844,8 @@ int main(int argc, char *argv[])
 			mkfs_time_opt = TRUE;
 		} else if(strcmp(argv[i], "-all-time") == 0) {
 			if((++i == argc) ||
-				!parse_num_unsigned(argv[i], &all_time)) {
+				(!parse_num_unsigned(argv[i], &all_time) &&
+				!exec_date(argv[i], &all_time))) {
 					ERROR("%s: %s missing or invalid time "
 						"value\n", argv[0],
 						argv[i - 1]);
@@ -7079,31 +7860,80 @@ int main(int argc, char *argv[])
 		else if(strcmp(argv[i], "-root-mode") == 0) {
 			if((++i == argc) || !parse_mode(argv[i], &root_mode)) {
 				ERROR("%s: -root-mode missing or invalid mode,"
-					" octal number <= 07777 expected\n", argv[0]);
+					" octal number <= 07777 expected\n",
+					argv[0]);
 				exit(1);
 			}
 			root_mode_opt = TRUE;
 		} else if(strcmp(argv[i], "-root-uid") == 0) {
-			if((++i == argc) || !parse_num_unsigned(argv[i], &root_uid)) {
-				ERROR("%s: -root-uid missing or invalid uid\n",
+			if(++i == argc) {
+				ERROR("%s: -root-uid missing uid or user name\n",
 					argv[0]);
+				exit(1);
+			}
+
+			res = get_uid_from_arg(argv[i], &root_uid);
+			if(res) {
+				if(res == -2)
+					ERROR("%s: -root-uid uid out of range\n",
+						argv[0]);
+				else
+					ERROR("%s: -root-uid invalid uid or "
+						"unknown user name\n", argv[0]);
 				exit(1);
 			}
 			root_uid_opt = TRUE;
 		} else if(strcmp(argv[i], "-root-gid") == 0) {
-			if((++i == argc) || !parse_num_unsigned(argv[i], &root_gid)) {
-				ERROR("%s: -root-gid missing or invalid gid\n",
+			if(++i == argc) {
+				ERROR("%s: -root-gid missing gid or group name\n",
 					argv[0]);
+				exit(1);
+			}
+
+			res = get_gid_from_arg(argv[i], &root_gid);
+			if(res) {
+				if(res == -2)
+					ERROR("%s: -root-gid gid out of range\n",
+						argv[0]);
+				else
+					ERROR("%s: -root-gid invalid gid or "
+						"unknown group name\n", argv[0]);
 				exit(1);
 			}
 			root_gid_opt = TRUE;
 		} else if(strcmp(argv[i], "-root-time") == 0) {
-			if((++i == argc) || !parse_num_unsigned(argv[i], &root_time)) {
+			if((++i == argc) ||
+					(!parse_num_unsigned(argv[i], &root_time) &&
+					!exec_date(argv[i], &root_time))) {
 				ERROR("%s: -root-time missing or invalid time\n",
 					argv[0]);
 				exit(1);
 			}
 			root_time_opt = TRUE;
+		} else if(strcmp(argv[i], "-default-mode") == 0) {
+			if((++i == argc) || !parse_mode(argv[i], &default_mode)) {
+				ERROR("%s: -default-mode missing or invalid mode,"
+					" octal number <= 07777 expected\n", argv[0]);
+				exit(1);
+			}
+			root_mode = default_mode;
+			default_mode_opt = root_mode_opt = TRUE;
+		} else if(strcmp(argv[i], "-default-uid") == 0) {
+			if((++i == argc) || !parse_num_unsigned(argv[i], &default_uid)) {
+				ERROR("%s: -default-uid missing or invalid uid\n",
+					argv[0]);
+				exit(1);
+			}
+			root_uid = default_uid;
+			default_uid_opt = root_uid_opt = TRUE;
+		} else if(strcmp(argv[i], "-default-gid") == 0) {
+			if((++i == argc) || !parse_num_unsigned(argv[i], &default_gid)) {
+				ERROR("%s: -default-gid missing or invalid gid\n",
+					argv[0]);
+				exit(1);
+			}
+			root_gid = default_gid;
+			default_gid_opt = root_gid_opt = TRUE;
 		} else if(strcmp(argv[i], "-log") == 0) {
 			if(++i == argc) {
 				ERROR("%s: %s missing log file\n",
@@ -7196,11 +8026,7 @@ int main(int argc, char *argv[])
 			if(read_action_file(argv[i], ACTION_LOG_FALSE) == FALSE)
 				exit(1);
 
-		} else if(strcmp(argv[i], "-comp") == 0)
-			/* parsed previously */
-			i++;
-
-		else if(strncmp(argv[i], "-X", 2) == 0) {
+		} else if(strncmp(argv[i], "-X", 2) == 0) {
 			int args;
 
 			if(strcmp(argv[i] + 2, "help") == 0)
@@ -7229,11 +8055,7 @@ print_compressor_options:
 			i += args;
 
 		} else if(strcmp(argv[i], "-pf") == 0) {
-			if(++i == argc) {
-				ERROR("%s: -pf missing filename\n", argv[0]);
-				exit(1);
-			}
-			if(read_pseudo_file(argv[i], destination_file) == FALSE)
+			if(read_pseudo_file(argv[++i], destination_file) == FALSE)
 				exit(1);
 		} else if(strcmp(argv[i], "-p") == 0) {
 			if(++i == argc) {
@@ -7350,6 +8172,51 @@ print_compressor_options:
 			}
 			calculate_queue_sizes(total_mem, &readq, &fragq,
 				&bwriteq, &fwriteq);
+		} else if(strcmp(argv[i], "-mem-percent") == 0) {
+			int percent, phys_mem;
+
+			/*
+			 * Percentage of 75% and larger is dealt with later.
+			 * In the same way a fixed mem size if more than 75%
+			 * of memory is dealt with later.
+			 */
+			if((++i == argc) ||
+					!parse_number(argv[i], &percent, 1) ||
+					(percent < 1)) {
+				ERROR("%s: -mem-percent missing or invalid "
+					"percentage: it should be 1 - 75%\n",
+					 argv[0]);
+				exit(1);
+			}
+
+			phys_mem = get_physical_memory();
+
+			if(phys_mem == 0) {
+				ERROR("%s: -mem-percent unable to get physical "
+					"memory, use -mem instead\n", argv[0]);
+				exit(1);
+			}
+
+			if(multiply_overflow(phys_mem, percent)) {
+				ERROR("%s: -mem-percent requested phys mem too "
+					"large\n", argv[0]);
+				exit(1);
+			}
+
+			total_mem = phys_mem * percent / 100;
+
+			if(total_mem < (SQUASHFS_LOWMEM / SQUASHFS_TAKE)) {
+				ERROR("%s: -mem-percent mem too small, should "
+					"be %d Mbytes or larger\n", argv[0],
+					SQUASHFS_LOWMEM / SQUASHFS_TAKE);
+				exit(1);
+			}
+
+			calculate_queue_sizes(total_mem, &readq, &fragq,
+				&bwriteq, &fwriteq);
+		} else if(strcmp(argv[i], "-mem-default") == 0) {
+			printf("%d\n", total_mem);
+			exit(0);
 		} else if(strcmp(argv[i], "-b") == 0) {
 			if(++i == argc) {
 				ERROR("%s: -b missing block size\n", argv[0]);
@@ -7376,7 +8243,8 @@ print_compressor_options:
 		else if(strcmp(argv[i], "-no-fragments") == 0)
 			no_fragments = TRUE;
 
-		 else if(strcmp(argv[i], "-tailends") == 0 || strcmp(argv[i], "-always-use-fragments") == 0)
+		 else if(strcmp(argv[i], "-tailends") == 0 ||
+				 strcmp(argv[i], "-always-use-fragments") == 0)
 			always_use_fragments = TRUE;
 
 		else if(strcmp(argv[i], "-no-tailends") == 0)
@@ -7388,56 +8256,48 @@ print_compressor_options:
 				exit(1);
 			}
 		} else if(strcmp(argv[i], "-all-root") == 0 ||
-				strcmp(argv[i], "-root-owned") == 0)
+				strcmp(argv[i], "-root-owned") == 0) {
 			global_uid = global_gid = 0;
-
-		else if(strcmp(argv[i], "-force-uid") == 0) {
+			global_uid_opt = global_gid_opt = TRUE;
+		} else if(strcmp(argv[i], "-force-uid") == 0) {
 			if(++i == argc) {
-				ERROR("%s: -force-uid missing uid or user\n",
+				ERROR("%s: -force-uid missing uid or user name\n",
 					argv[0]);
 				exit(1);
 			}
-			if((global_uid = strtoll(argv[i], &b, 10)), *b =='\0') {
-				if(global_uid < 0 || global_uid >
-						(((long long) 1 << 32) - 1)) {
-					ERROR("%s: -force-uid uid out of range"
-						"\n", argv[0]);
-					exit(1);
-				}
-			} else {
-				struct passwd *uid = getpwnam(argv[i]);
-				if(uid)
-					global_uid = uid->pw_uid;
-				else {
+
+			res = get_uid_from_arg(argv[i], &global_uid);
+			if(res) {
+				if(res == -2)
+					ERROR("%s: -force-uid uid out of range\n",
+						argv[0]);
+				else
 					ERROR("%s: -force-uid invalid uid or "
-						"unknown user\n", argv[0]);
-					exit(1);
-				}
+						"unknown user name\n", argv[0]);
+				exit(1);
 			}
+			global_uid_opt = TRUE;
 		} else if(strcmp(argv[i], "-force-gid") == 0) {
 			if(++i == argc) {
-				ERROR("%s: -force-gid missing gid or group\n",
+				ERROR("%s: -force-gid missing gid or group name\n",
 					argv[0]);
 				exit(1);
 			}
-			if((global_gid = strtoll(argv[i], &b, 10)), *b =='\0') {
-				if(global_gid < 0 || global_gid >
-						(((long long) 1 << 32) - 1)) {
+
+			res = get_gid_from_arg(argv[i], &global_gid);
+			if(res) {
+				if(res == -2)
 					ERROR("%s: -force-gid gid out of range"
 						"\n", argv[0]);
-					exit(1);
-				}
-			} else {
-				struct group *gid = getgrnam(argv[i]);
-				if(gid)
-					global_gid = gid->gr_gid;
-				else {
+				else
 					ERROR("%s: -force-gid invalid gid or "
-						"unknown group\n", argv[0]);
-					exit(1);
-				}
+						"unknown group name\n", argv[0]);
+				exit(1);
 			}
-		} else if(strcmp(argv[i], "-noI") == 0 ||
+			global_gid_opt = TRUE;
+		} else if(strcmp(argv[i], "-pseudo-override") == 0)
+			pseudo_override = TRUE;
+		else if(strcmp(argv[i], "-noI") == 0 ||
 				strcmp(argv[i], "-noInodeCompression") == 0)
 			noI = TRUE;
 
@@ -7457,10 +8317,21 @@ print_compressor_options:
 				strcmp(argv[i], "-noXattrCompression") == 0)
 			noX = TRUE;
 
-		else if(strcmp(argv[i], "-no-xattrs") == 0)
+		else if(strcmp(argv[i], "-no-compression") == 0)
+			noI = noD = noF = noX = TRUE;
+
+		else if(strcmp(argv[i], "-no-xattrs") == 0) {
+			if(xattr_exclude_preg || xattr_include_preg ||
+							add_xattrs()) {
+				ERROR("%s: -no-xattrs should not be used in "
+					"combination with -xattrs-* options\n",
+					argv[0]);
+				exit(1);
+			}
+
 			no_xattrs = TRUE;
 
-		else if(strcmp(argv[i], "-xattrs") == 0) {
+		} else if(strcmp(argv[i], "-xattrs") == 0) {
 			if(xattrs_supported())
 				no_xattrs = FALSE;
 			else {
@@ -7469,6 +8340,46 @@ print_compressor_options:
 				exit(1);
 			}
 
+		} else if(strcmp(argv[i], "-xattrs-exclude") == 0) {
+			if(!xattrs_supported()) {
+				ERROR("%s: xattrs are unsupported in "
+					"this build\n", argv[0]);
+				exit(1);
+			} else if(++i == argc) {
+				ERROR("%s: -xattrs-exclude missing regex pattern\n",
+					argv[0]);
+				exit(1);
+			} else {
+				xattr_exclude_preg = xattr_regex(argv[i], "exclude");
+				no_xattrs = FALSE;
+			}
+
+		} else if(strcmp(argv[i], "-xattrs-include") == 0) {
+			if(!xattrs_supported()) {
+				ERROR("%s: xattrs are unsupported in "
+					"this build\n", argv[0]);
+				exit(1);
+			} else if(++i == argc) {
+				ERROR("%s: -xattrs-include missing regex pattern\n",
+					argv[0]);
+				exit(1);
+			} else {
+				xattr_include_preg = xattr_regex(argv[i], "include");
+				no_xattrs = FALSE;
+			}
+		} else if(strcmp(argv[i], "-xattrs-add") == 0) {
+			if(!xattrs_supported()) {
+				ERROR("%s: xattrs are unsupported in "
+					"this build\n", argv[0]);
+				exit(1);
+			} else if(++i == argc) {
+				ERROR("%s: -xattrs-add missing xattr argument\n",
+					argv[0]);
+				exit(1);
+			} else {
+				xattrs_add(argv[i]);
+				no_xattrs = FALSE;
+			}
 		} else if(strcmp(argv[i], "-nopad") == 0)
 			nopad = TRUE;
 
@@ -7479,7 +8390,7 @@ print_compressor_options:
 			break;
 
 		else if(strcmp(argv[i], "-noappend") == 0)
-			delete = TRUE;
+			appending = FALSE;
 
 		else if(strcmp(argv[i], "-quiet") == 0)
 			quiet = TRUE;
@@ -7497,14 +8408,26 @@ print_compressor_options:
 				exit(1);
 			}	
 			root_name = argv[i];
+		} else if(strcmp(argv[i], "-percentage") == 0) {
+			progressbar_percentage();
+			progress = silent = TRUE;
 		} else if(strcmp(argv[i], "-version") == 0) {
 			print_version("mksquashfs");
+		} else if(strcmp(argv[i], "-cpiostyle") == 0 ||
+				strcmp(argv[i], "-cpiostyle0") == 0 ||
+				strcmp(argv[i], "-tar") == 0) {
+			/* parsed previously */
+		} else if(strcmp(argv[i], "-comp") == 0) {
+			/* parsed previously */
+			i++;
 		} else {
 			ERROR("%s: invalid option\n\n", argv[0]);
 			print_options(stderr, argv[0], total_mem);
 			exit(1);
 		}
 	}
+
+	check_env_var();
 
 	/* If cpiostyle is set, then file names  will be read-in
 	 * from standard in.  We do not expect to have any sources
@@ -7513,8 +8436,6 @@ print_compressor_options:
 		BAD_ERROR("Sources on the command line should be -, "
 			"when using -cpiostyle[0] options\n");
 
-	check_env_var();
-
 	/* If -tar option is set, then files will be read-in
 	 * from standard in.  We do not expect to have any sources
 	 * specified on the command line */
@@ -7522,18 +8443,15 @@ print_compressor_options:
 		BAD_ERROR("Sources on the command line should be -, "
 			"when using -tar option\n");
 
-	/* If -tar option is set, then check that actions and pseudo files
-	 * have not been specified, which are unsupported with tar file reading
+	/* If -tar option is set, then check that actions have not been
+	 * specified, which are unsupported with tar file reading
 	 */
 	if(tarfile && any_actions())
 		BAD_ERROR("Actions are unsupported when reading tar files\n");
 
-	if(tarfile && get_pseudo())
-		BAD_ERROR("Pseudo files are unsupported when reading tar files\n");
-
 	/*
-	 * The -noI option implies -noId for backwards compatibility, so reset noId
-	 * if both have been specified
+	 * The -noI option implies -noId for backwards compatibility, so reset
+	 * noId if both have been specified
 	 */
 	if(noI && noId)
 		noId = FALSE;
@@ -7554,6 +8472,20 @@ print_compressor_options:
 	if(!silent)
 		progress = force_progress;
 		
+	/*
+	 * Sort all the xattr-add options now they're all processed
+	 */
+	sort_xattr_add_list();
+
+	/*
+	 * If -pseudo-override option has been specified and there are
+	 * no pseudo files then reset option.  -pseudo-override relies
+	 * on dir_scan2() being run, which won't be if there's no
+	 * actions or pseudo files
+	 */
+	if(pseudo_override && !get_pseudo())
+		pseudo_override = FALSE;
+
 #ifdef SQUASHFS_TRACE
 	/*
 	 * Disable progress bar if full debug tracing is enabled.
@@ -7587,13 +8519,13 @@ print_compressor_options:
 
 	if(stat(destination_file, &buf) == -1) {
 		if(errno == ENOENT) { /* Does not exist */
+			appending = FALSE;
 			fd = open(destination_file, O_CREAT | O_TRUNC | O_RDWR,
 				S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
 			if(fd == -1) {
 				perror("Could not create destination file");
 				exit(1);
 			}
-			delete = TRUE;
 
 			/* ensure Mksquashfs doesn't try to read
 			 * the destination file as input, which
@@ -7615,7 +8547,7 @@ print_compressor_options:
 			exit(1);
 		}
 
-		if(tarfile && !delete) {
+		if(tarfile && appending) {
 			ERROR("Appending is not supported reading tar files\n");
 			ERROR("To force Mksquashfs to write to this %s "
 				"use -noappend\n", S_ISBLK(buf.st_mode) ?
@@ -7632,7 +8564,7 @@ print_compressor_options:
 			block_device = 1;
 
 		} else {
-			fd = open(destination_file, (delete ? O_TRUNC : 0) |
+			fd = open(destination_file, (!appending ? O_TRUNC : 0) |
 				O_RDWR);
 			if(fd == -1) {
 				perror("Could not open regular file for "
@@ -7690,7 +8622,7 @@ print_compressor_options:
 		else if(option_with_arg(argv[i], option_table))
 			i++;
 
-	if(!delete) {
+	if(appending) {
 	        comp = read_super(fd, &sBlk, destination_file);
 	        if(comp == NULL) {
 			ERROR("Failed to read existing filesystem - will not "
@@ -7715,7 +8647,7 @@ print_compressor_options:
 		comp_opts = SQUASHFS_COMP_OPTS(sBlk.flags);
 	}
 
-	initialise_threads(readq, fragq, bwriteq, fwriteq, delete,
+	initialise_threads(readq, fragq, bwriteq, fwriteq, !appending,
 		destination_file);
 
 	res = compressor_init(comp, &stream, SQUASHFS_METADATA_SIZE, 0);
@@ -7733,7 +8665,7 @@ print_compressor_options:
 	memset(dupl_block, 0, 1048576 * sizeof(struct file_info *));
 	memset(dupl_frag, 0, block_size * sizeof(struct file_info *));
 
-	if(delete) {
+	if(!appending) {
 		int size;
 		void *comp_data = compressor_dump_options(comp, block_size,
 			&size);
@@ -7762,15 +8694,15 @@ print_compressor_options:
 		} else			
 			bytes = sizeof(struct squashfs_super_block);
 	} else {
-		unsigned int last_directory_block, inode_dir_offset,
-			inode_dir_file_size, root_inode_size,
-			inode_dir_start_block, uncompressed_data,
+		unsigned int last_directory_block, inode_dir_file_size,
+			root_inode_size, inode_dir_start_block,
 			compressed_data, inode_dir_inode_number,
 			inode_dir_parent_inode;
 		unsigned int root_inode_start =
 			SQUASHFS_INODE_BLK(sBlk.root_inode),
 			root_inode_offset =
 			SQUASHFS_INODE_OFFSET(sBlk.root_inode);
+		int inode_dir_offset, uncompressed_data;
 
 		if((bytes = read_filesystem(root_name, fd, &sBlk, &inode_table,
 				&data_cache, &directory_table,
@@ -7797,19 +8729,22 @@ print_compressor_options:
 				BAD_ERROR("Out of memory in save filesystem state\n");
 		}
 
-		printf("Appending to existing %d.%d filesystem on %s, block "
-			"size %d\n", SQUASHFS_MAJOR, SQUASHFS_MINOR, destination_file,
-			block_size);
-		printf("All -b, -noI, -noD, -noF, -noX, -noId, -no-duplicates, "
-			"-no-fragments,\n-always-use-fragments, -exportable and "
-			"-comp options ignored\n");
-		printf("\nIf appending is not wanted, please re-run with "
-			"-noappend specified!\n\n");
+		if(!quiet) {
+			printf("Appending to existing %d.%d filesystem on "
+				"%s, block size %d\n", SQUASHFS_MAJOR,
+				SQUASHFS_MINOR, destination_file, block_size);
+			printf("All -b, -noI, -noD, -noF, -noX, -noId, "
+				"-no-duplicates, -no-fragments,\n"
+				"-always-use-fragments, -exportable and "
+				"-comp options ignored\n");
+			printf("\nIf appending is not wanted, please re-run "
+				"with -noappend specified!\n\n");
+		}
 
-		compressed_data = (inode_dir_offset + inode_dir_file_size) &
-			~(SQUASHFS_METADATA_SIZE - 1);
-		uncompressed_data = (inode_dir_offset + inode_dir_file_size) &
-			(SQUASHFS_METADATA_SIZE - 1);
+		compressed_data = ((long long) inode_dir_offset +
+			inode_dir_file_size) & ~(SQUASHFS_METADATA_SIZE - 1);
+		uncompressed_data = ((long long) inode_dir_offset +
+			inode_dir_file_size) & (SQUASHFS_METADATA_SIZE - 1);
 		
 		/* save original filesystem state for restoring ... */
 		sfragments = fragments;
@@ -7841,7 +8776,6 @@ print_compressor_options:
 		sid_count = id_count;
 		write_recovery_data(&sBlk);
 		save_xattrs();
-		appending = TRUE;
 
 		/*
 		 * set the filesystem state up to be able to append to the
@@ -7949,7 +8883,11 @@ print_compressor_options:
 		write_destination(fd, bytes, 4096 - i, temp);
 	}
 
-	close(fd);
+	res = close(fd);
+
+	if(res == -1)
+		BAD_ERROR("Failed to close output filesystem, close returned %s\n",
+				strerror(errno));
 
 	if(recovery_file)
 		unlink(recovery_file);

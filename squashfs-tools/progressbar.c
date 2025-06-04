@@ -2,7 +2,7 @@
  * Create a squashfs filesystem.  This is a highly compressed read only
  * filesystem.
  *
- * Copyright (c) 2012, 2013, 2014, 2021
+ * Copyright (c) 2012, 2013, 2014, 2021, 2022
  * Phillip Lougher <phillip@squashfs.org.uk>
  *
  * This program is free software; you can redistribute it and/or
@@ -39,26 +39,29 @@
 #define TRUE 1
 
 /* flag whether progressbar display is enabled or not */
-int display_progress_bar = FALSE;
+static int display_progress_bar = FALSE;
 
 /* flag whether the progress bar is temporarily disbled */
-int temp_disabled = FALSE;
+static int temp_disabled = FALSE;
+
+/* flag whether to display full progress bar or just a percentage */
+static int percent = FALSE;
 
 /* flag whether we need to output a newline before printing
  * a line - this is because progressbar printing does *not*
  * output a newline */
-int need_nl = FALSE;
+static int need_nl = FALSE;
 
-int rotate = 0;
-int cur_uncompressed = 0, estimated_uncompressed = 0;
-int columns;
+static int rotate = 0;
+static long long cur_uncompressed = 0, estimated_uncompressed = 0;
+static int columns;
 
-pthread_t progress_thread;
-pthread_mutex_t progress_mutex = PTHREAD_MUTEX_INITIALIZER;
-pthread_mutex_t size_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_t progress_thread;
+static pthread_mutex_t progress_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t size_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 
-static void sigwinch_handler()
+static void sigwinch_handler(int arg)
 {
 	struct winsize winsize;
 
@@ -69,6 +72,12 @@ static void sigwinch_handler()
 		columns = 80;
 	} else
 		columns = winsize.ws_col;
+}
+
+
+void progressbar_percentage()
+{
+	percent = TRUE;
 }
 
 
@@ -93,7 +102,7 @@ void progress_bar_size(int count)
 }
 
 
-static void progress_bar(long long current, long long max, int columns)
+static void progressbar(long long current, long long max, int columns)
 {
 	char rotate_list[] = { '|', '/', '-', '\\' };
 	int max_digits, used, hashes, spaces, percentage;
@@ -147,6 +156,28 @@ static void progress_bar(long long current, long long max, int columns)
 }
 
 
+static void display_percentage(long long current, long long max)
+{
+	int percentage = max == 0 ? 100 : current * 100 / max;
+	static int previous = -1;
+
+	if(percentage != previous) {
+		printf("%d\n", percentage);
+		fflush(stdout);
+		previous = percentage;
+	}
+}
+
+
+static void progress_bar(long long current, long long max, int columns)
+{
+	if(percent)
+		display_percentage(current, max);
+	else
+		progressbar(current, max, columns);
+}
+
+
 void enable_progress_bar()
 {
 	pthread_cleanup_push((void *) pthread_mutex_unlock, &progress_mutex);
@@ -188,7 +219,7 @@ void set_progressbar_state(int state)
 }
 
 
-void *progress_thrd(void *arg)
+static void *progress_thrd(void *arg)
 {
 	struct timespec requested_time, remaining;
 	struct winsize winsize;
@@ -211,9 +242,8 @@ void *progress_thrd(void *arg)
 		if(res == -1 && errno != EINTR)
 			BAD_ERROR("nanosleep failed in progress thread\n");
 
-		rotate = (rotate + 1) % 4;
-
 		pthread_mutex_lock(&progress_mutex);
+		rotate = (rotate + 1) % 4;
 		if(display_progress_bar && !temp_disabled) {
 			progress_bar(cur_uncompressed, estimated_uncompressed, columns);
 			need_nl = TRUE;

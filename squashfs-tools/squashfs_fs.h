@@ -4,7 +4,7 @@
  * Squashfs
  *
  * Copyright (c) 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2009, 2010, 2012,
- * 2013, 2014, 2017, 2019
+ * 2013, 2014, 2017, 2019, 2022
  * Phillip Lougher <phillip@squashfs.org.uk>
  *
  * This program is free software; you can redistribute it and/or
@@ -49,6 +49,9 @@
 
 /* Max value for directory header count */
 #define SQUASHFS_DIR_COUNT		256
+
+/* Max length of a symbolic ink */
+#define SQUASHFS_SYMLINK_MAX		65535
 
 #define SQUASHFS_INVALID		((long long) 0xffffffffffff)
 #define SQUASHFS_INVALID_FRAG		((unsigned int) 0xffffffff)
@@ -219,7 +222,7 @@
 					sizeof(long long))
 
 /* xattr id lookup table defines */
-#define SQUASHFS_XATTR_BYTES(A)		((A) * sizeof(struct squashfs_xattr_id))
+#define SQUASHFS_XATTR_BYTES(A)		(((long long) (A)) * sizeof(struct squashfs_xattr_id))
 
 #define SQUASHFS_XATTR_BLOCK(A)		(SQUASHFS_XATTR_BYTES(A) / \
 					SQUASHFS_METADATA_SIZE)

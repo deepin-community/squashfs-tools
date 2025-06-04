@@ -2,7 +2,7 @@
  * Read a squashfs filesystem.  This is a highly compressed read only
  * filesystem.
  *
- * Copyright (c) 2010, 2012, 2013, 2019, 2021
+ * Copyright (c) 2010, 2012, 2013, 2019, 2021, 2022
  * Phillip Lougher <phillip@squashfs.org.uk>
  *
  * This program is free software; you can redistribute it and/or
@@ -30,6 +30,7 @@
 #define FALSE 0
 #include <stdio.h>
 #include <string.h>
+#include <regex.h>
 
 #include "squashfs_fs.h"
 #include "squashfs_swap.h"
@@ -38,12 +39,12 @@
 
 #include <stdlib.h>
 
-extern int read_fs_bytes(int, long long, int, void *);
+extern int read_fs_bytes(int, long long, long long, void *);
 extern int read_block(int, long long, long long *, int, void *);
 
 static struct hash_entry {
 	long long		start;
-	unsigned int		offset;
+	long long		offset;
 	struct hash_entry	*next;
 } *hash_table[65536];
 
@@ -65,7 +66,7 @@ struct prefix prefix_table[] = {
  * store mapping from location of compressed block in fs ->
  * location of uncompressed block in memory
  */
-static int save_xattr_block(long long start, int offset)
+static int save_xattr_block(long long start, long long offset)
 {
 	struct hash_entry *hash_entry = malloc(sizeof(*hash_entry));
 	int hash = start & 0xffff;
@@ -88,7 +89,7 @@ static int save_xattr_block(long long start, int offset)
  * map from location of compressed block in fs ->
  * location of uncompressed block in memory
  */
-static int get_xattr_block(long long start)
+static long long get_xattr_block(long long start)
 {
 	int hash = start & 0xffff;
 	struct hash_entry *hash_entry = hash_table[hash];
@@ -144,7 +145,7 @@ static int read_xattr_entry(struct xattr_list *xattr,
  * Read and decompress the xattr id table and the xattr metadata.
  * This is cached in memory for later use by get_xattr()
  */
-int read_xattrs_from_disk(int fd, struct squashfs_super_block *sBlk, int flag, long long *table_start)
+unsigned int read_xattrs_from_disk(int fd, struct squashfs_super_block *sBlk, int sanity_only, long long *table_start)
 {
 	/*
 	 * Note on overflow limits:
@@ -161,9 +162,6 @@ int read_xattrs_from_disk(int fd, struct squashfs_super_block *sBlk, int flag, l
 
 	TRACE("read_xattrs_from_disk\n");
 
-	if(sBlk->xattr_id_table_start == SQUASHFS_INVALID_BLK)
-		return SQUASHFS_INVALID_BLK;
-
 	/*
 	 * Read xattr id table, containing start of xattr metadata and the
 	 * number of xattrs in the file system
@@ -171,7 +169,7 @@ int read_xattrs_from_disk(int fd, struct squashfs_super_block *sBlk, int flag, l
 	res = read_fs_bytes(fd, sBlk->xattr_id_table_start, sizeof(id_table),
 		&id_table);
 	if(res == 0)
-		return 0;
+		goto failed;
 
 	SQUASHFS_INSWAP_XATTR_TABLE(&id_table);
 
@@ -179,17 +177,22 @@ int read_xattrs_from_disk(int fd, struct squashfs_super_block *sBlk, int flag, l
 	 * Compute index table values
 	 */
 	ids = id_table.xattr_ids;
+	if(ids == 0) {
+		ERROR("FATAL ERROR: File system corrupted - xattr_ids is 0 in xattr table\n");
+		goto failed;
+	}
+
 	xattr_table_start = id_table.xattr_table_start;
-	index_bytes = SQUASHFS_XATTR_BLOCK_BYTES((long long) ids);
-	indexes = SQUASHFS_XATTR_BLOCKS((long long) ids);
+	index_bytes = SQUASHFS_XATTR_BLOCK_BYTES(ids);
+	indexes = SQUASHFS_XATTR_BLOCKS(ids);
 
 	/*
 	 * The size of the index table (index_bytes) should match the
 	 * table start and end points
 	 */
 	if(index_bytes != (sBlk->bytes_used - (sBlk->xattr_id_table_start + sizeof(id_table)))) {
-		ERROR("read_xattrs_from_disk: Bad xattr_ids count in super block\n");
-		return 0;
+		ERROR("FATAL ERROR: File system corrupted  - Bad xattr_ids count in super block\n");
+		goto failed;
 	}
 
 	/*
@@ -201,12 +204,12 @@ int read_xattrs_from_disk(int fd, struct squashfs_super_block *sBlk, int flag, l
 		*table_start = id_table.xattr_table_start;
 
 	/*
-	 * If flag is set then return once we've read the above
+	 * If sanity_only is set then return once we've read the above
 	 * table_start.  That value is necessary for sanity checking,
 	 * but we don't actually want to extract the xattrs, and so
 	 * stop here.
 	 */
-	if(flag)
+	if(sanity_only)
 		return id_table.xattr_ids;
 
 	/*
@@ -216,7 +219,7 @@ int read_xattrs_from_disk(int fd, struct squashfs_super_block *sBlk, int flag, l
 	index = malloc(index_bytes);
 	if(index == NULL) {
 		ERROR("FATAL ERROR: Out of memory (%s)\n", __func__);
-		return -1;
+		goto failed;
 	}
 
 	res = read_fs_bytes(fd, sBlk->xattr_id_table_start + sizeof(id_table),
@@ -230,11 +233,11 @@ int read_xattrs_from_disk(int fd, struct squashfs_super_block *sBlk, int flag, l
 	 * Allocate enough space for the uncompressed xattr id table, and
 	 * read and decompress it
 	 */
-	bytes = SQUASHFS_XATTR_BYTES((long long) ids);
+	bytes = SQUASHFS_XATTR_BYTES(ids);
 	xattr_ids = malloc(bytes);
 	if(xattr_ids == NULL) {
 		ERROR("FATAL ERROR: Out of memory (%s)\n", __func__);
-		return -1;
+		goto failed1;
 	}
 
 	for(i = 0; i < indexes; i++) {
@@ -246,8 +249,8 @@ int read_xattrs_from_disk(int fd, struct squashfs_super_block *sBlk, int flag, l
 		TRACE("Read xattr id table block %d, from 0x%llx, length "
 			"%d\n", i, index[i], length);
 		if(length == 0) {
-			ERROR("Failed to read xattr id table block %d, "
-				"from 0x%llx, length %d\n", i, index[i],
+			ERROR("FATAL ERROR - Failed to read xattr id table block %d, "
+				"from 0x%llx, length %d.  File system corrupted?\n", i, index[i],
 				length);
 			goto failed2;
 		}
@@ -267,7 +270,7 @@ int read_xattrs_from_disk(int fd, struct squashfs_super_block *sBlk, int flag, l
 		xattrs = realloc(xattrs, (i + 1) * SQUASHFS_METADATA_SIZE);
 		if(xattrs == NULL) {
 			ERROR("FATAL ERROR: Out of memory (%s)\n", __func__);
-			return -1;
+			goto failed3;
 		}
 
 		/* store mapping from location of compressed block in fs ->
@@ -275,7 +278,7 @@ int read_xattrs_from_disk(int fd, struct squashfs_super_block *sBlk, int flag, l
 		res = save_xattr_block(start, i * SQUASHFS_METADATA_SIZE);
 		if (res == FALSE) {
 			ERROR("FATAL ERROR: Out of memory (%s)\n", __func__);
-			return -1;
+			goto failed3;
 		}
 
 		length = read_block(fd, start, &start, 0,
@@ -283,7 +286,7 @@ int read_xattrs_from_disk(int fd, struct squashfs_super_block *sBlk, int flag, l
 			(i * SQUASHFS_METADATA_SIZE));
 		TRACE("Read xattr block %d, length %d\n", i, length);
 		if(length == 0) {
-			ERROR("Failed to read xattr block %d\n", i);
+			ERROR("FATAL ERROR - Failed to read xattr block %d.  File system corrupted?\n", i);
 			goto failed3;
 		}
 
@@ -295,8 +298,8 @@ int read_xattrs_from_disk(int fd, struct squashfs_super_block *sBlk, int flag, l
 		 * after reading.
 		 */
 		if(start != end && length != SQUASHFS_METADATA_SIZE) {
-			ERROR("Xattr block %d should be %d bytes in length, "
-				"it is %d bytes\n", i, SQUASHFS_METADATA_SIZE,
+			ERROR("FATAL ERROR: Xattr block %d should be %d bytes in length, "
+				"it is %d bytes.  File system corrupted?\n", i, SQUASHFS_METADATA_SIZE,
 				length);
 			goto failed3;
 		}
@@ -317,7 +320,8 @@ failed2:
 failed1:
 	free(index);
 
-	return 0;
+failed:
+	return FALSE;
 }
 
 
@@ -354,7 +358,7 @@ void free_xattr(struct xattr_list *xattr_list, int count)
  */
 struct xattr_list *get_xattr(int i, unsigned int *count, int *failed)
 {
-	long long start;
+	long long start, xptr_offset;
 	struct xattr_list *xattr_list = NULL;
 	unsigned int offset;
 	void *xptr;
@@ -372,7 +376,16 @@ struct xattr_list *get_xattr(int i, unsigned int *count, int *failed)
 
 	start = SQUASHFS_XATTR_BLK(xattr_ids[i].xattr) + xattr_table_start;
 	offset = SQUASHFS_XATTR_OFFSET(xattr_ids[i].xattr);
-	xptr = xattrs + get_xattr_block(start) + offset;
+	xptr_offset = get_xattr_block(start);
+
+	if(xptr_offset == -1) {
+		ERROR("FATAL ERROR: file system is corrupt - incorrect xattr value in metadata\n");
+		*failed = FALSE;
+		return NULL;
+	}
+
+
+	xptr = xattrs + xptr_offset + offset;
 
 	TRACE("get_xattr: xattr_id %d, count %d, start %lld, offset %d\n", i,
 			xattr_ids[i].count, start, offset);

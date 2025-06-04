@@ -3,7 +3,7 @@
  * filesystem.
  *
  * Copyright (c) 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2009, 2010,
- * 2012, 2013, 2014, 2019, 2021
+ * 2012, 2013, 2014, 2019, 2021, 2022
  * Phillip Lougher <phillip@squashfs.org.uk>
  *
  * This program is free software; you can redistribute it and/or
@@ -35,13 +35,14 @@
 #include <limits.h>
 #include <dirent.h>
 #include <stdlib.h>
+#include <regex.h>
 
 #include "squashfs_fs.h"
 #include "squashfs_swap.h"
 #include "compressor.h"
+#include "mksquashfs.h"
 #include "xattr.h"
 #include "mksquashfs_error.h"
-#include "mksquashfs.h"
 
 int read_block(int fd, long long start, long long *next, int expected,
 								void *block)
@@ -120,9 +121,9 @@ unsigned char *scan_inode_table(int fd, long long start, long long end,
 	unsigned char *cur_ptr;
 	unsigned char *inode_table = NULL;
 	int byte, files = 0;
-	unsigned int directory_start_block, bytes = 0, size = 0;
+	unsigned int directory_start_block;
 	struct squashfs_base_inode_header base;
-	int alloc_size;
+	long long alloc_size, bytes = 0, size = 0;
 
 	TRACE("scan_inode_table: start 0x%llx, end 0x%llx, root_inode_start "
 		"0x%llx\n", start, end, root_inode_start);
@@ -149,8 +150,7 @@ unsigned char *scan_inode_table(int fd, long long start, long long end,
 			*root_inode_block = bytes;
 		}
 		if(size - bytes < SQUASHFS_METADATA_SIZE) {
-			inode_table = realloc(inode_table, size
-				+= alloc_size);
+			inode_table = realloc(inode_table, size += alloc_size);
 			if(inode_table == NULL)
 				MEM_ERROR();
 		}
@@ -180,7 +180,7 @@ unsigned char *scan_inode_table(int fd, long long start, long long end,
 		goto corrupted;
 
 	/*
-	 * The number of bytes available after the root inode medata block
+	 * The number of bytes available after the root inode metadata block
 	 * should be at least the root inode offset + the size of a
 	 * regular directory inode, if not the filesystem is corrupted
 	 *
@@ -224,6 +224,16 @@ unsigned char *scan_inode_table(int fd, long long start, long long end,
 		/* bad type, corrupted filesystem */
 		goto corrupted;
 
+	if(dir_inode->base.uid >= sBlk->no_ids) {
+		ERROR("File system corrupted - uid index in inode too large (uid: %d)\n", dir_inode->base.uid);
+		goto corrupted2;
+	}
+
+	if(dir_inode->base.guid >= sBlk->no_ids) {
+		ERROR("File system corrupted - gid index in inode too large (gid: %d)\n", dir_inode->base.guid);
+		goto corrupted2;
+	}
+
 	get_uid(id_table[dir_inode->base.uid]);
 	get_guid(id_table[dir_inode->base.guid]);
 
@@ -247,6 +257,16 @@ unsigned char *scan_inode_table(int fd, long long start, long long end,
 			"0x%x, type 0x%x\n",
 			(unsigned int) (cur_ptr - inode_table),
 			base.inode_type);
+
+		if(base.uid >= sBlk->no_ids) {
+			ERROR("File system corrupted - uid index in inode too large (uid: %d)\n", base.uid);
+			goto corrupted2;
+		}
+
+		if(base.guid >= sBlk->no_ids) {
+			ERROR("File system corrupted - gid index in inode too large (gid: %d)\n", base.guid);
+			goto corrupted2;
+		}
 
 		get_uid(id_table[base.uid]);
 		get_guid(id_table[base.guid]);
@@ -549,12 +569,15 @@ unsigned char *scan_inode_table(int fd, long long start, long long end,
 		}
 	}
 	
-	printf("Read existing filesystem, %d inodes scanned\n", files);
+	if(!quiet)
+		printf("Read existing filesystem, %d inodes scanned\n", files);
+
 	return inode_table;
 
 corrupted:
 	ERROR("scan_inode_table: filesystem corruption detected in "
 		"scanning metadata\n");
+corrupted2:
 	free(inode_table);
 	return NULL;
 }
@@ -626,7 +649,7 @@ struct compressor *read_super(int fd, struct squashfs_super_block *sBlk, char *s
 	 * line which need to be over-ridden).
 	 *
 	 * Compressor_extract_options is also used to ensure that 
-	 * we know how decompress a filesystem compressed with these
+	 * we know how to decompress a filesystem compressed with these
 	 * compression options.
 	 */
 	if(SQUASHFS_COMP_OPTS(sBlk->flags)) {
@@ -645,6 +668,9 @@ struct compressor *read_super(int fd, struct squashfs_super_block *sBlk, char *s
 		ERROR("Compressor failed to set compressor options\n");
 		goto failed_mount;
 	}
+
+	if(quiet)
+		return comp;
 
 	printf("Found a valid %sSQUASHFS superblock on %s.\n",
 		SQUASHFS_EXPORTABLE(sBlk->flags) ? "exportable " : "", source);
@@ -688,8 +714,8 @@ failed_mount:
 }
 
 
-unsigned char *squashfs_readdir(int fd, int root_entries,
-	unsigned int directory_start_block, int offset, int size,
+static unsigned char *squashfs_readdir(int fd, int root_entries,
+	unsigned int directory_start_block, int offset, unsigned int dir_size,
 	unsigned int *last_directory_block, struct squashfs_super_block *sBlk,
 	void (push_directory_entry)(char *, squashfs_inode, unsigned int, int))
 {
@@ -698,9 +724,9 @@ unsigned char *squashfs_readdir(int fd, int root_entries,
 		__attribute__ ((aligned));
 	struct squashfs_dir_entry *dire = (struct squashfs_dir_entry *) buffer;
 	unsigned char *directory_table = NULL;
-	int byte, bytes = 0, dir_count;
-	long long start = sBlk->directory_table_start + directory_start_block,
-		last_start_block = start; 
+	int byte, dir_count;
+	long long start = sBlk->directory_table_start + directory_start_block;
+	long long last_start_block = start, size = dir_size, bytes = 0;
 
 	size += offset;
 	directory_table = malloc((size + SQUASHFS_METADATA_SIZE * 2 - 1) &
@@ -713,7 +739,7 @@ unsigned char *squashfs_readdir(int fd, int root_entries,
 			SQUASHFS_METADATA_SIZE : 0;
 
 		TRACE("squashfs_readdir: reading block 0x%llx, bytes read so "
-			"far %d\n", start, bytes);
+			"far %lld\n", start, bytes);
 
 		last_start_block = start;
 		byte = read_block(fd, start, &start, expected, directory_table + bytes);
@@ -743,7 +769,7 @@ unsigned char *squashfs_readdir(int fd, int root_entries,
 		}
 
 		TRACE("squashfs_readdir: Read directory header @ byte position "
-			"0x%x, 0x%x directory entries\n", bytes, dir_count);
+			"0x%llx, 0x%x directory entries\n", bytes, dir_count);
 		bytes += sizeof(dirh);
 
 		while(dir_count--) {
@@ -778,7 +804,7 @@ all_done:
 }
 
 
-unsigned int *read_id_table(int fd, struct squashfs_super_block *sBlk)
+static unsigned int *read_id_table(int fd, struct squashfs_super_block *sBlk)
 {
 	int indexes = SQUASHFS_ID_BLOCKS(sBlk->no_ids);
 	long long index[indexes];
@@ -829,7 +855,7 @@ unsigned int *read_id_table(int fd, struct squashfs_super_block *sBlk)
 }
 
 
-struct squashfs_fragment_entry *read_fragment_table(int fd, struct squashfs_super_block *sBlk)
+static struct squashfs_fragment_entry *read_fragment_table(int fd, struct squashfs_super_block *sBlk)
 {
 	int res;
 	unsigned int i;
@@ -883,7 +909,7 @@ struct squashfs_fragment_entry *read_fragment_table(int fd, struct squashfs_supe
 }
 
 
-squashfs_inode *read_inode_lookup_table(int fd, struct squashfs_super_block *sBlk)
+static squashfs_inode *read_inode_lookup_table(int fd, struct squashfs_super_block *sBlk)
 {
 	int lookup_bytes = SQUASHFS_LOOKUP_BYTES(sBlk->inodes);
 	int indexes = SQUASHFS_LOOKUP_BLOCKS(sBlk->inodes);
@@ -933,7 +959,7 @@ squashfs_inode *read_inode_lookup_table(int fd, struct squashfs_super_block *sBl
 long long read_filesystem(char *root_name, int fd, struct squashfs_super_block *sBlk,
 	char **cinode_table, char **data_cache, char **cdirectory_table,
 	char **directory_data_cache, unsigned int *last_directory_block,
-	unsigned int *inode_dir_offset, unsigned int *inode_dir_file_size,
+	int *inode_dir_offset, unsigned int *inode_dir_file_size,
 	unsigned int *root_inode_size, unsigned int *inode_dir_start_block,
 	unsigned int *file_count, unsigned int *sym_count, unsigned int *dev_count,
 	unsigned int *dir_count, unsigned int *fifo_count, unsigned int *sock_count,
@@ -956,7 +982,8 @@ long long read_filesystem(char *root_name, int fd, struct squashfs_super_block *
 	unsigned int *id_table = NULL;
 	int res;
 
-	printf("Scanning existing filesystem...\n");
+	if(!quiet)
+		printf("Scanning existing filesystem...\n");
 
 	if(get_xattrs(fd, sBlk) == 0)
 		goto error;

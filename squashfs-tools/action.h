@@ -4,7 +4,7 @@
  * Create a squashfs filesystem.  This is a highly compressed read only
  * filesystem.
  *
- * Copyright (c) 2011, 2012, 2013, 2014, 2021
+ * Copyright (c) 2011, 2012, 2013, 2014, 2021, 2022
  * Phillip Lougher <phillip@squashfs.org.uk>
  *
  * This program is free software; you can redistribute it and/or
@@ -161,22 +161,25 @@ struct type_entry {
 /*
  * Action definitions
  */
-#define FRAGMENT_ACTION 0
-#define EXCLUDE_ACTION 1
-#define FRAGMENTS_ACTION 2
-#define NO_FRAGMENTS_ACTION 3
-#define ALWAYS_FRAGS_ACTION 4
-#define NO_ALWAYS_FRAGS_ACTION 5
-#define COMPRESSED_ACTION 6
-#define UNCOMPRESSED_ACTION 7
-#define UID_ACTION 8
-#define GID_ACTION 9
-#define GUID_ACTION 10
-#define MODE_ACTION 11
-#define EMPTY_ACTION 12
-#define MOVE_ACTION 13
-#define PRUNE_ACTION 14
-#define NOOP_ACTION 15
+#define FRAGMENT_ACTION		0
+#define EXCLUDE_ACTION		1
+#define FRAGMENTS_ACTION	2
+#define NO_FRAGMENTS_ACTION	3
+#define ALWAYS_FRAGS_ACTION	4
+#define NO_ALWAYS_FRAGS_ACTION	5
+#define COMPRESSED_ACTION	6
+#define UNCOMPRESSED_ACTION	7
+#define UID_ACTION		8
+#define GID_ACTION		9
+#define GUID_ACTION		10
+#define MODE_ACTION		11
+#define EMPTY_ACTION		12
+#define MOVE_ACTION		13
+#define PRUNE_ACTION		14
+#define NOOP_ACTION		15
+#define XATTR_EXC_ACTION	16
+#define XATTR_INC_ACTION	17
+#define XATTR_ADD_ACTION	18
 
 /*
  * Define what file types each action operates over
@@ -209,7 +212,7 @@ struct action_entry {
 
 
 struct action_data {
-	int depth;
+	unsigned int depth;
 	char *name;
 	char *pathname;
 	char *subpath;
@@ -292,6 +295,15 @@ struct move_ent {
 
 
 /*
+ * Xattr action specific definitions
+ */
+struct xattr_data {
+	regex_t			preg;
+	struct xattr_data	*next;
+};
+
+
+/*
  * Perm test function specific definitions
  */
 #define PERM_ALL 1
@@ -311,12 +323,20 @@ extern int parse_action(char *, int verbose);
 extern void dump_actions();
 extern void *eval_frag_actions(struct dir_info *, struct dir_ent *, int);
 extern void *get_frag_action(void *);
-extern int eval_exclude_actions(char *, char *, char *, struct stat *, int,
-							struct dir_ent *);
+extern int eval_exclude_actions(char *, char *, char *, struct stat *,
+					unsigned int, struct dir_ent *);
 extern void eval_actions(struct dir_info *, struct dir_ent *);
 extern int eval_empty_actions(struct dir_info *, struct dir_ent *dir_ent);
 extern void eval_move_actions(struct dir_info *, struct dir_ent *);
 extern int eval_prune_actions(struct dir_info *, struct dir_ent *);
+extern struct xattr_data *eval_xattr_exc_actions(struct dir_info *,
+							struct dir_ent *);
+extern int match_xattr_exc_actions(struct xattr_data *, char *);
+extern struct xattr_data *eval_xattr_inc_actions(struct dir_info *,
+							struct dir_ent *);
+extern int match_xattr_inc_actions(struct xattr_data *, char *);
+extern struct xattr_add *eval_xattr_add_actions(struct dir_info *root,
+					struct dir_ent *dir_ent, int *items);
 extern void do_move_actions();
 extern long long read_bytes(int, void *, long long);
 extern int any_actions();
@@ -326,4 +346,6 @@ extern int empty_actions();
 extern int read_action_file(char *, int);
 extern int exclude_actions();
 extern int prune_actions();
+extern int xattr_exc_actions();
+extern int xattr_add_actions();
 #endif

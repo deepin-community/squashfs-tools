@@ -2,7 +2,7 @@
  * Create a squashfs filesystem.  This is a highly compressed read only
  * filesystem.
  *
- * Copyright (c) 2008, 2009, 2010, 2012, 2014, 2019, 2021
+ * Copyright (c) 2008, 2009, 2010, 2012, 2014, 2019, 2021, 2022
  * Phillip Lougher <phillip@squashfs.org.uk>
  *
  * This program is free software; you can redistribute it and/or
@@ -22,6 +22,8 @@
  * xattr.c
  */
 
+#include "endian_compat.h"
+
 #define TRUE 1
 #define FALSE 0
 
@@ -35,6 +37,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <sys/xattr.h>
+#include <regex.h>
 
 #include "squashfs_fs.h"
 #include "squashfs_swap.h"
@@ -44,6 +47,15 @@
 #include "progressbar.h"
 #include "pseudo.h"
 #include "tar.h"
+#include "action.h"
+#include "merge_sort.h"
+
+#ifdef XATTR_NOFOLLOW /* Apple's xattrs */
+	#define llistxattr(path_, buf_, sz_) \
+		listxattr(path_, buf_, sz_, XATTR_NOFOLLOW)
+	#define lgetxattr(path_, name_, val_, sz_) \
+		getxattr(path_, name_, val_, sz_, 0, XATTR_NOFOLLOW)
+#endif
 
 /* compressed xattr table */
 static char *xattr_table = NULL;
@@ -73,11 +85,17 @@ static struct xattr_list *dupl_value[65536];
 /* xattr hash table for id duplicate detection */
 static struct dupl_id *dupl_id[65536];
 
+/* xattr-add option names and values */
+static struct xattr_add *xattr_add_list = NULL;
+static int xattr_add_count = 0;
+
 /* file system globals from mksquashfs.c */
 extern int no_xattrs, noX;
 extern long long bytes;
 extern int fd;
 extern unsigned int xattr_bytes, total_xattr_bytes;
+extern regex_t *xattr_exclude_preg;
+extern regex_t *xattr_include_preg;
 
 /* helper functions from mksquashfs.c */
 extern unsigned short get_checksum(char *, int, unsigned short);
@@ -87,38 +105,53 @@ extern int mangle(char *, char *, int, int, int, int);
 extern char *pathname(struct dir_ent *);
 
 /* helper functions and definitions from read_xattrs.c */
-extern int read_xattrs_from_disk(int, struct squashfs_super_block *, int, long long *);
+extern unsigned int read_xattrs_from_disk(int, struct squashfs_super_block *, int, long long *);
 extern struct xattr_list *get_xattr(int, unsigned int *, int *);
 extern struct prefix prefix_table[];
 
 
-int xattr_get_prefix(struct xattr_list *xattr, char *name)
+static int xattr_get_type(char *name)
 {
 	int i;
 
-	xattr->full_name = strdup(name);
-
 	for(i = 0; prefix_table[i].type != -1; i++) {
 		struct prefix *p = &prefix_table[i];
-		if(strncmp(xattr->full_name, p->prefix, strlen(p->prefix)) == 0)
+		if(strncmp(name, p->prefix, strlen(p->prefix)) == 0)
 			break;
-	}
-
-	if(prefix_table[i].type != -1) {
-		xattr->name = xattr->full_name + strlen(prefix_table[i].prefix);
-		xattr->size = strlen(xattr->name);
 	}
 
 	return prefix_table[i].type;
 }
 
+
+static void xattr_copy_prefix(struct xattr_list *xattr, int t, char *name)
+{
+	xattr->full_name = strdup(name);
+	xattr->name = xattr->full_name + strlen(prefix_table[t].prefix);
+	xattr->size = strlen(xattr->name);
+}
+
+
+int xattr_get_prefix(struct xattr_list *xattr, char *name)
+{
+	int type = xattr_get_type(name);
+
+	if(type != -1)
+		xattr_copy_prefix(xattr, type, name);
+
+	return type;
+}
+
 	
-static int read_xattrs_from_system(char *filename, struct xattr_list **xattrs)
+static int read_xattrs_from_system(struct dir_ent *dir_ent, char *filename,
+						struct xattr_list **xattrs)
 {
 	ssize_t size, vsize;
 	char *xattr_names, *p;
-	int i;
+	int i = 0;
 	struct xattr_list *xattr_list = NULL;
+	struct xattr_data *xattr_exc_list;
+	struct xattr_data *xattr_inc_list;
 
 	while(1) {
 		size = llistxattr(filename, NULL, 0);
@@ -154,22 +187,55 @@ static int read_xattrs_from_system(char *filename, struct xattr_list **xattrs)
 		break;
 	}
 
-	for(i = 0, p = xattr_names; p < xattr_names + size; i++) {
-		struct xattr_list *x = realloc(xattr_list, (i + 1) *
-						sizeof(struct xattr_list));
+	xattr_exc_list = eval_xattr_exc_actions(root_dir, dir_ent);
+	xattr_inc_list = eval_xattr_inc_actions(root_dir, dir_ent);
+
+	for(p = xattr_names; p < xattr_names + size;) {
+		struct xattr_list *x;
+		int res;
+
+		res = match_xattr_exc_actions(xattr_exc_list, p);
+		if(res) {
+			p += strlen(p) + 1;
+			continue;
+		}
+
+		if(xattr_exclude_preg) {
+			res = regexec(xattr_exclude_preg, p, (size_t) 0, NULL, 0);
+			if(res == 0) {
+				p += strlen(p) + 1;
+				continue;
+			}
+		}
+
+		res = match_xattr_inc_actions(xattr_inc_list, p);
+		if(res) {
+			p += strlen(p) + 1;
+			continue;
+		}
+
+		if(xattr_include_preg) {
+			res = regexec(xattr_include_preg, p, (size_t) 0, NULL, 0);
+			if(res) {
+				p += strlen(p) + 1;
+				continue;
+			}
+		}
+
+		x = realloc(xattr_list, (i + 1) * sizeof(struct xattr_list));
 		if(x == NULL)
 			MEM_ERROR();
 		xattr_list = x;
 
 		xattr_list[i].type = xattr_get_prefix(&xattr_list[i], p);
-		p += strlen(p) + 1;
+
 		if(xattr_list[i].type == -1) {
-			ERROR("Unrecognised xattr prefix %s\n",
-				xattr_list[i].full_name);
-			free(xattr_list[i].full_name);
-			i--;
+			ERROR("Unrecognised xattr prefix %s\n", p);
+			p += strlen(p) + 1;
 			continue;
 		}
+
+		p += strlen(p) + 1;
 
 		while(1) {
 			vsize = lgetxattr(filename, xattr_list[i].full_name,
@@ -206,13 +272,17 @@ static int read_xattrs_from_system(char *filename, struct xattr_list **xattrs)
 			
 			break;
 		}
+
 		xattr_list[i].vsize = vsize;
 
 		TRACE("read_xattrs_from_system: filename %s, xattr name %s,"
 			" vsize %d\n", filename, xattr_list[i].full_name,
 			xattr_list[i].vsize);
+		i++;
 	}
+
 	free(xattr_names);
+
 	if(i > 0)
 		*xattrs = xattr_list;
 	else
@@ -477,6 +547,19 @@ long long write_xattrs()
 }
 
 
+void free_xattr_list(int xattrs, struct xattr_list *xattr_list)
+{
+	int i;
+
+	for(i = 0; i < xattrs; i++) {
+		free(xattr_list[i].full_name);
+		free(xattr_list[i].value);
+	}
+
+	free(xattr_list);
+}
+
+
 int generate_xattrs(int xattrs, struct xattr_list *xattr_list)
 {
 	int total_size, i;
@@ -490,8 +573,10 @@ int generate_xattrs(int xattrs, struct xattr_list *xattr_list)
 	 * id
 	 */
 	xattr_dupl = check_id_dupl(xattr_list, xattrs);
-	if(xattr_dupl->xattr_id != SQUASHFS_INVALID_XATTR)
+	if(xattr_dupl->xattr_id != SQUASHFS_INVALID_XATTR) {
+		free_xattr_list(xattrs, xattr_list);
 		return xattr_dupl->xattr_id;
+	}
 	 
 	/*
 	 * Scan the xattr_list deciding which type to assign to each
@@ -611,25 +696,169 @@ int generate_xattrs(int xattrs, struct xattr_list *xattr_list)
 }
 
 
-int read_xattrs(void *d)
+/*
+ * Instantiate two implementations of merge sort with different types and names
+ */
+SORT(sort_list, xattr_add, name, next);
+SORT(sort_xattr_list, xattr_list, full_name, vnext);
+
+
+int read_xattrs(void *d, int type)
 {
 	struct dir_ent *dir_ent = d;
 	struct inode_info *inode = dir_ent->inode;
 	char *filename = pathname(dir_ent);
-	struct xattr_list *xattr_list;
-	int xattrs;
+	struct xattr_list *xattr_list = NULL, *head;
+	int count, i = 0, j;
+	struct xattr_add *l1 = xattr_add_list, *l2 = NULL, *l3 = NULL;
+	struct xattr_add *action_add_list;
 
-	if(no_xattrs || IS_PSEUDO(inode) || inode->root_entry || inode->dummy_root_dir)
+	if(no_xattrs || inode->root_entry)
 		return SQUASHFS_INVALID_XATTR;
 
 	if(IS_TARFILE(inode))
-		xattrs = read_xattrs_from_tarfile(inode, &xattr_list);
-	else
-		xattrs = read_xattrs_from_system(filename, &xattr_list);
-	if(xattrs == 0)
-		return SQUASHFS_INVALID_XATTR;
+		i = read_xattrs_from_tarfile(inode, &xattr_list);
+	else if(!inode->dummy_root_dir && !IS_PSEUDO(inode))
+		i = read_xattrs_from_system(dir_ent, filename, &xattr_list);
 
-	return generate_xattrs(xattrs, xattr_list);
+	action_add_list = eval_xattr_add_actions(root_dir, dir_ent, &count);
+
+	/*
+	 * At this point we may have up to 3 lists of xattrs:
+	 *
+	 * 1. a list of xattrs created by the global xattrs-add command line
+	 * 2. a list of xattrs created by one or more pseudo xattr definitions
+	 *    on this file.
+	 * 3. a list of xattrs created by one or more xattr add actions on this
+	 *    file.
+	 *
+	 * The global xattrs are sorted, but, the pseudo xattr list and action
+	 * xattr list are not.
+	 *
+	 * So sort the pseudo and action lists, and merge the three sorted lists
+	 * together whilst adding them to the xattr_list
+	 */
+
+	if(inode->xattr) {
+		sort_list(&(inode->xattr->xattr), inode->xattr->count);
+		l2 = inode->xattr->xattr;
+	}
+
+	if(action_add_list) {
+		sort_list(&action_add_list, count);
+		l3 = action_add_list;
+	}
+
+	while(l1 || l2 || l3) {
+		struct xattr_list *x;
+		struct xattr_add *entry;
+
+		if(l1 && l2 && l3) {
+			if(strcmp(l1->name, l2->name) <= 0) {
+				if(strcmp(l1->name, l3->name) <= 0) {
+					entry= l1;
+					l1 = l1->next;
+				} else {
+					entry = l3;
+					l3 = l3->next;
+				}
+			} else {
+				if(strcmp(l2->name, l3->name) <= 0) {
+					entry = l2;
+					l2 = l2->next;
+				} else {
+					entry = l3;
+					l3 = l3->next;
+				}
+			}
+		} else if(l1 && l2) {
+			if(strcmp(l1->name, l2->name) <= 0) {
+				entry = l1;
+				l1 = l1->next;
+			} else {
+				entry = l2;
+				l2 = l2->next;
+			}
+		} else if(l1 && l3) {
+			if(strcmp(l1->name, l3->name) <= 0) {
+				entry = l1;
+				l1 = l1->next;
+			} else {
+				entry = l3;
+				l3 = l3->next;
+			}
+		} else if(l2 && l3) {
+			if(strcmp(l2->name, l3->name) <= 0) {
+				entry = l2;
+				l2 = l2->next;
+			} else {
+				entry = l3;
+				l3 = l3->next;
+			}
+		} else if(l1) {
+			entry = l1;
+			l1 = l1->next;
+		} else if(l2) {
+			entry = l2;
+			l2 = l2->next;
+		} else {
+			entry = l3;
+			l3 = l3->next;
+		}
+
+		/*
+		 * User extended attributes are only allowed for files and
+		 * directories.  See man 7 xattr for explanation.
+		 */
+		if((entry->type == SQUASHFS_XATTR_USER) &&
+				(type != SQUASHFS_FILE_TYPE &&
+				 type != SQUASHFS_DIR_TYPE))
+			continue;
+
+		x = realloc(xattr_list, (i + 1) * sizeof(struct xattr_list));
+		if(x == NULL)
+			MEM_ERROR();
+		xattr_list = x;
+
+		xattr_list[i].type = entry->type;
+		xattr_copy_prefix(&xattr_list[i], entry->type, entry->name);
+
+		xattr_list[i].value = malloc(entry->vsize);
+		if(xattr_list[i].value == NULL)
+			MEM_ERROR();
+
+		memcpy(xattr_list[i].value, entry->value, entry->vsize);
+		xattr_list[i].vsize = entry->vsize;
+
+		TRACE("read_xattrs: filename %s, xattr name %s,"
+			" vsize %d\n", filename, xattr_list[i].full_name,
+			xattr_list[i].vsize);
+		i++;
+	}
+
+	if(i == 0)
+		return SQUASHFS_INVALID_XATTR;
+	else if(i == 1)
+		goto skip_dup_check;
+
+	/*
+	 * Sort and check xattr list for duplicates
+	 */
+	for(j = 1;  j < i; j++)
+		xattr_list[j - 1].vnext = &xattr_list[j];
+
+	xattr_list[i - 1].vnext = NULL;
+	head = xattr_list;
+
+	sort_xattr_list(&head, i);
+
+	for(j = 0; j < i - 1; head=head->vnext, j++)
+		if(strcmp(head->full_name, head->vnext->full_name) == 0)
+			BAD_ERROR("Duplicate xattr name %s in file %s\n",
+					head->full_name, filename);
+
+skip_dup_check:
+	return generate_xattrs(i, xattr_list);
 }
 
 
@@ -641,18 +870,17 @@ int read_xattrs(void *d)
  */
 int get_xattrs(int fd, struct squashfs_super_block *sBlk)
 {
-	int ids, res, i, id;
-	unsigned int count;
+	int res, i, id;
+	unsigned int count, ids;
 
 	TRACE("get_xattrs\n");
 
-	res = read_xattrs_from_disk(fd, sBlk, FALSE, NULL);
-	if(res == SQUASHFS_INVALID_BLK || res == 0)
-		return res;
-	else if(res == -1)
-		EXIT_MKSQUASHFS();
+	if(sBlk->xattr_id_table_start == SQUASHFS_INVALID_BLK)
+		return SQUASHFS_INVALID_BLK;
 
-	ids = res;
+	ids = read_xattrs_from_disk(fd, sBlk, FALSE, NULL);
+	if(ids == 0)
+		EXIT_MKSQUASHFS();
 
 	/*
 	 * for each xattr id read and construct its list of xattr
@@ -725,4 +953,370 @@ void restore_xattrs()
 
 	/* restore the state of the xattr id table */
 	xattr_ids = sxattr_ids;
+}
+
+
+regex_t *xattr_regex(char *pattern, char *option)
+{
+	int error;
+	regex_t *preg = malloc(sizeof(regex_t));
+
+	if(preg == NULL)
+		MEM_ERROR();
+
+	error = regcomp(preg, pattern, REG_EXTENDED|REG_NOSUB);
+
+	if(error) {
+		char str[1024]; /* overflow safe */
+
+		regerror(error, preg, str, 1024);
+		BAD_ERROR("invalid regex %s in xattrs-%s option, because %s\n",
+				pattern, option, str);
+	}
+
+	return preg;
+}
+
+
+char *base64_decode(char *source, int size, int *bytes)
+{
+	char *dest;
+	unsigned char *dest_ptr, *source_ptr = (unsigned char *) source;
+	int bit_pos = 0;
+	int output = 0;
+	int count;
+
+	if(size % 4 == 0) {
+		/* Check for and ignore any end padding */
+		if(source_ptr[size - 2] == '=' && source_ptr[size - 1] == '=')
+			size -= 2;
+		else if(source_ptr[size - 1] == '=')
+			size --;
+	}
+
+	/* Calculate number of bytes the base64 encoding represents */
+	count = size * 3 / 4;
+
+	dest = malloc(count);
+
+	for(dest_ptr = (unsigned char *) dest; size; size --, source_ptr ++) {
+		int value = *source_ptr;
+
+		if(value >= 'A' && value <= 'Z')
+			value -= 'A';
+		else if(value >= 'a' && value <= 'z')
+			value -= 'a' - 26;
+		else if(value >= '0' && value <= '9')
+			value -= '0' - 52;
+		else if(value == '+')
+			value = 62;
+		else if(value == '/')
+			value = 63;
+		else
+			goto failed;
+
+		if(bit_pos == 24) {
+			dest_ptr[0] = output >> 16;
+			dest_ptr[1] = (output >> 8) & 0xff;
+			dest_ptr[2] = output & 0xff;
+			bit_pos = 0;
+			output = 0;
+			dest_ptr += 3;
+		}
+
+		output = (output << 6) | value;
+		bit_pos += 6;
+	}
+
+	output = output << (24 - bit_pos);
+
+	if(bit_pos == 6)
+		goto failed;
+
+	if(bit_pos >= 12)
+		dest_ptr[0] = output >> 16;
+
+	if(bit_pos >= 18)
+		dest_ptr[1] = (output >> 8) & 0xff;
+
+	if(bit_pos == 24)
+		dest_ptr[2] = output & 0xff;
+
+	*bytes = (dest_ptr - (unsigned char *) dest) + (bit_pos / 8);
+	return dest;
+
+failed:
+	free(dest);
+	return NULL;
+}
+
+
+char *hex_decode(char *source, int size, int *bytes)
+{
+	char *dest;
+	unsigned char *dest_ptr, *source_ptr = (unsigned char *) source;
+	int first = 0;
+
+	if(size % 2 != 0)
+		return NULL;
+
+	dest = malloc(size >> 2);
+	if(dest == NULL)
+		MEM_ERROR();
+
+	for(dest_ptr = (unsigned char *) dest ; size; size --) {
+		int digit = *source_ptr ++;
+
+		if(digit >= 'A' && digit <= 'F')
+			digit -= 'A' - 10;
+		else if(digit >= 'a' && digit <= 'f')
+			digit -= 'a' - 10;
+		else if(digit >= '0' && digit <= '9')
+			digit -= '0';
+		else
+			goto failed;
+
+		if(size % 2 == 0)
+			first = digit;
+		else
+			*dest_ptr ++ = (first << 4) | digit; 
+	}
+
+	*bytes = dest_ptr - (unsigned char *) dest;
+
+	return dest;
+
+failed:
+	free(dest);
+	return NULL;
+}
+
+
+int decode_octal(unsigned char *ptr)
+{
+	int i, output = 0;
+
+	for(i = 0; i < 3; i++) {
+		int val = *ptr ++;
+
+		if(val < '0' || val > '7')
+			return -1;
+
+		output = (output << 3) | (val - '0');
+	}
+
+	return output < 256 ? output : -1;
+}
+
+
+char *text_decode(char *source, int *bytes)
+{
+	unsigned char *dest, *dest_ptr, *ptr = (unsigned char *) source;
+	int size = 0;
+
+	for(; *ptr; size ++, ptr ++) {
+		if(*ptr == '\\') {
+			if(ptr[1] != '\0' && ptr[2] != '\0' && ptr[3] != '\0')
+				ptr += 3;
+			else
+				return NULL;
+		}
+	}
+
+	dest = malloc(size);
+	if(dest == NULL)
+		MEM_ERROR();
+
+	*bytes = size;
+
+	for(ptr = (unsigned char *) source, dest_ptr = dest; size; size --) {
+		if(*ptr == '\\') {
+			int res = decode_octal(++ ptr);
+
+			if(res == -1)
+				goto failed;
+
+			*dest_ptr ++ = res;
+			ptr += 3;
+		} else
+			*dest_ptr ++ = *ptr ++;
+	}
+
+	return (char *) dest;
+
+failed:
+	free(dest);
+	return NULL;
+}
+
+
+struct xattr_add *xattr_parse(char *str, char *pre, char *option)
+{
+	struct xattr_add *entry;
+	char *value;
+	int prefix, size;
+
+	/*
+	 * Look for the "=" separating the xattr name from the value
+	 */
+	for(value = str; *value != '=' && *value != '\0'; value ++);
+	if(*value == '\0') {
+		ERROR("%sinvalid argument \"%s\" in %s option, because no "
+				"`=` found\n", pre, str, option);
+		goto failed;
+	}
+
+	if(value == str) {
+		ERROR("%sinvalid argument \"%s\" in %s option, because xattr "
+				"name is empty\n", pre, str, option);
+		goto failed;
+	}
+
+	if(*(value + 1) == '\0') {
+		ERROR("%sinvalid argument \"%s\" in %s option, because xattr "
+				"value is empty\n", pre, str, option);
+		goto failed;
+	}
+
+	entry = malloc(sizeof(struct xattr_add));
+	if(entry == NULL)
+		MEM_ERROR();
+
+	entry->name = strndup(str, value++ - str);
+	entry->type = xattr_get_type(entry->name);
+
+	if(entry->type == -1) {
+		ERROR("%s%s: unrecognised xattr prefix in %s\n", pre, option,
+								entry->name);
+		goto failed2;
+	}
+
+	/*
+	 * Evaluate the format prefix (if any)
+	 */
+	if(*(value + 1) == '\0')
+		/*
+		 * By definition an xattr value of 1 byte hasn't a prefix,
+		 * and should be treated as binary
+		 */
+		prefix = 0;
+	else
+		prefix = (*value << 8) + *(value + 1);
+
+	switch(prefix) {
+	case PREFIX_BASE64_0S:
+	case PREFIX_BASE64_0s:
+		value += 2;
+		if(*value == 0) {
+			ERROR("%sinvalid argument %s in %s option, because "
+				"xattr value is empty after format prefix 0S "
+				"or 0s\n", pre, str, option);
+			goto failed2;
+		}
+
+		entry->value = base64_decode(value, strlen(value), &size);
+		entry->vsize = size;
+
+		if(entry->value == NULL) {
+			ERROR("%sinvalid argument %s in %s option, because "
+				"invalid base64 value\n", pre, str, option);
+			goto failed2;
+		}
+		break;
+
+	case PREFIX_HEX_0X:
+	case PREFIX_HEX_0x:
+		value += 2;
+		if(*value == 0) {
+			ERROR("%sinvalid argument %s in %s option, because "
+				"xattr value is empty after format prefix 0X "
+				"or 0x\n", pre, str, option);
+			goto failed2;
+		}
+
+		entry->value = hex_decode(value, strlen(value), &size);
+		entry->vsize = size;
+
+		if(entry->value == NULL) {
+			ERROR("%sinvalid argument %s in %s option, because "
+				"invalid hexidecimal value\n", pre, str, option);
+			goto failed2;
+		}
+		break;
+
+	case PREFIX_TEXT_0T:
+	case PREFIX_TEXT_0t:
+		value += 2;
+		if(*value == 0) {
+			ERROR("%sinvalid argument %s in %s option, because "
+				"xattr value is empty after format prefix 0T "
+				"or 0t\n", pre, str, option);
+			goto failed2;
+		}
+
+		entry->value = text_decode(value, &size);
+		entry->vsize = size;
+
+		if(entry->value == NULL) {
+			ERROR("%sinvalid argument %s in %s option, because "
+				"invalid text value\n", pre, str, option);
+			goto failed2;
+		}
+		break;
+
+	case PREFIX_BINARY_0B:
+	case PREFIX_BINARY_0b:
+		value += 2;
+		if(*value == 0) {
+			ERROR("%sinvalid argument %s in %s option, because "
+				"xattr value is empty after format prefix 0B "
+				"or 0b\n", pre, str, option);
+			goto failed2;
+		}
+
+		/* fall through */
+	default:
+		entry->vsize = strlen(value);
+		entry->value = malloc(entry->vsize);
+
+		if(entry->value == NULL)
+			MEM_ERROR();
+
+		memcpy(entry->value, value, entry->vsize);
+	}
+
+	return entry;
+
+failed2:
+	free(entry->name);
+	free(entry);
+failed:
+	return NULL;
+}
+
+
+void xattrs_add(char *str)
+{
+	struct xattr_add *entry;
+
+	entry = xattr_parse(str, "FATAL ERROR: ", "xattrs-add");
+
+	if(entry) {
+		entry->next = xattr_add_list;
+		xattr_add_list = entry;
+
+		xattr_add_count ++;
+	} else
+		exit(1);
+}
+
+
+int add_xattrs(void) {
+	return xattr_add_count;
+}
+
+
+void sort_xattr_add_list(void)
+{
+	sort_list(&xattr_add_list, xattr_add_count);
 }

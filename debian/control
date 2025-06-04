@@ -1,10 +1,10 @@
 Source: squashfs-tools
 Section: kernel
 Priority: optional
-Maintainer: Deepin Developer <deepin-dev@deepin.org>
+Maintainer: Laszlo Boszormenyi (GCS) <gcs@debian.org>
 Build-Depends:
- debhelper-compat (= 13), libattr1-dev, liblzma-dev, liblzo2-dev, liblz4-dev, zlib1g-dev, libzstd-dev
-Standards-Version: 4.5.1
+ debhelper-compat (= 13), libattr1-dev, liblzma-dev, liblzo2-dev, liblz4-dev, zlib1g-dev, libzstd-dev, help2man
+Standards-Version: 4.6.2
 Homepage: https://github.com/plougher/squashfs-tools
 
 Package: squashfs-tools

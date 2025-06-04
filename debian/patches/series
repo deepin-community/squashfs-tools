@@ -1,7 +1,1 @@
-0001-kfreebsd.patch
-0002-fix_symlinks.patch
-0003-use-squashfs_closedir-to-delete-directory.patch
-0004-dynamically_allocate_name.patch
-0005-use_linked_list_to_store_directory_names.patch
-0006-additional_write_outside_destination_directory_exploit_fix.patch
-0007-add_makefile_entry_for_unsquash-12.patch
+#0001-kfreebsd.patch

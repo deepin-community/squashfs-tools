@@ -2,7 +2,7 @@
  * Create a squashfs filesystem.  This is a highly compressed read only
  * filesystem.
  *
- * Copyright (c) 2021
+ * Copyright (c) 2021, 2022
  * Phillip Lougher <phillip@squashfs.org.uk>
  *
  * This program is free software; you can redistribute it and/or
@@ -22,6 +22,8 @@
  * reader.c
  */
 
+/* if throttling I/O, time to sleep between reads (in tenths of a second) */
+int sleep_time;
 
 #define TRUE 1
 #define FALSE 0
@@ -38,6 +40,7 @@
 #include <errno.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <signal.h>
 #include "squashfs_fs.h"
 #include "mksquashfs.h"
 #include "caches-queues-lists.h"
@@ -46,8 +49,11 @@
 #include "pseudo.h"
 #include "sort.h"
 #include "tar.h"
+#include "reader.h"
 
-static void sigalrm_handler()
+static struct readahead **readahead_table = NULL;
+
+static void sigalrm_handler(int arg)
 {
 	struct timespec requested_time, remaining;
 
@@ -132,7 +138,6 @@ static void put_file_buffer(struct file_buffer *file_buffer)
 }
 
 
-static int seq = 0;
 static void reader_read_process(struct dir_ent *dir_ent)
 {
 	long long bytes = 0;
@@ -149,13 +154,13 @@ static void reader_read_process(struct dir_ent *dir_ent)
 	file = pseudo_exec_file(inode->pseudo, &child);
 	if(!file) {
 		file_buffer = cache_get_nohash(reader_buffer);
-		file_buffer->sequence = seq ++;
+		file_buffer->sequence = sequence_count ++;
 		goto read_err;
 	}
 
 	while(1) {
 		file_buffer = cache_get_nohash(reader_buffer);
-		file_buffer->sequence = seq ++;
+		file_buffer->sequence = sequence_count ++;
 		file_buffer->noD = inode->noD;
 
 		byte = read_bytes(file, file_buffer->data, block_size);
@@ -208,7 +213,7 @@ static void reader_read_process(struct dir_ent *dir_ent)
 		prev_buffer = file_buffer;
 	else {
 		cache_block_put(file_buffer);
-		seq --;
+		sequence_count --;
 	}
 	prev_buffer->file_size = bytes;
 	prev_buffer->fragment = is_fragment(inode);
@@ -221,7 +226,7 @@ read_err2:
 read_err:
 	if(prev_buffer) {
 		cache_block_put(file_buffer);
-		seq --;
+		sequence_count --;
 		file_buffer = prev_buffer;
 	}
 	file_buffer->error = TRUE;
@@ -254,14 +259,14 @@ again:
 
 	if(file == -1) {
 		file_buffer = cache_get_nohash(reader_buffer);
-		file_buffer->sequence = seq ++;
+		file_buffer->sequence = sequence_count ++;
 		goto read_err2;
 	}
 
 	do {
 		file_buffer = cache_get_nohash(reader_buffer);
 		file_buffer->file_size = read_size;
-		file_buffer->sequence = seq ++;
+		file_buffer->sequence = sequence_count ++;
 		file_buffer->noD = inode->noD;
 		file_buffer->error = FALSE;
 
@@ -342,11 +347,232 @@ read_err2:
 }
 
 
+static void remove_readahead(int index, struct readahead *prev, struct readahead *new)
+{
+	if(prev)
+		prev->next = new->next;
+	else
+		readahead_table[index] = new->next;
+}
+
+
+static void add_readahead(struct readahead *new)
+{
+	int index = READAHEAD_INDEX(new->start);
+
+	new->next = readahead_table[index];
+	readahead_table[index] = new;
+}
+
+
+static int get_bytes(char *data, int size)
+{
+	int res = fread(data, 1, size, stdin);
+
+	if(res == size)
+		return res;
+
+	return feof(stdin) ? 0 : -1;
+}
+
+
+static int get_readahead(struct pseudo_file *file, long long current,
+		struct file_buffer *file_buffer, int size)
+{
+	int count = size;
+	char *dest = file_buffer->data;
+
+	if(readahead_table == NULL)
+		return -1;
+
+	while(size) {
+		int index = READAHEAD_INDEX(current);
+		struct readahead *buffer = readahead_table[index], *prev = NULL;
+
+		for(; buffer; prev = buffer, buffer = buffer->next) {
+			if(buffer->start <= current && buffer->start + buffer->size > current) {
+				int offset = READAHEAD_OFFSET(current);
+				int buffer_offset = READAHEAD_OFFSET(buffer->start);
+
+				/*
+				 * Four posibilities:
+				 * 1. Wanted data is whole of buffer
+				 * 2. Wanted data is at start of buffer
+				 * 3. Wanted data is at end of buffer
+				 * 4. Wanted data is in middle of buffer
+				 */
+				if(offset == buffer_offset && size >= buffer->size) {
+					memcpy(dest, buffer->src, buffer->size);
+					dest += buffer->size;
+					size -= buffer->size;
+					current += buffer->size;
+
+					remove_readahead(index, prev, buffer);
+					free(buffer);
+					break;
+				} else if(offset == buffer_offset) {
+					memcpy(dest, buffer->src, size);
+					buffer->start += size;
+					buffer->src += size;
+					buffer->size -= size;
+
+					remove_readahead(index, prev, buffer);
+					add_readahead(buffer);
+
+					goto finished;
+				} else if(buffer_offset + buffer->size <= offset+ size) {
+					int bytes = buffer_offset + buffer->size - offset;
+
+					memcpy(dest, buffer->src + offset - buffer_offset, bytes);
+					buffer->size -= bytes;
+					dest += bytes;
+					size -= bytes;
+					current += bytes;
+					break;
+				} else {
+					struct readahead *left, *right;
+					int left_size = offset - buffer_offset;
+					int right_size = buffer->size - (offset + size);
+
+					memcpy(dest, buffer->src + offset - buffer_offset, size);
+
+					/* Split buffer into two */
+					left = malloc(sizeof(struct readahead) + left_size);
+					right = malloc(sizeof(struct readahead) + right_size);
+
+					if(left == NULL || right == NULL)
+						MEM_ERROR();
+
+					left->start = buffer->start;
+					left->size = left_size;
+					left->src = left->data;
+					memcpy(left->data, buffer->src, left_size);
+
+					right->start = current + size;
+					right->size = right_size;
+					right->src = right->data;
+					memcpy(right->data, buffer->src + offset + size, right_size);
+
+					remove_readahead(index, prev, buffer);
+					free(buffer);
+
+					add_readahead(left);
+					add_readahead(right);
+					goto finished;
+				}
+			}
+		}
+
+		if(buffer == NULL)
+			return -1;
+	}
+
+finished:
+	return count;
+}
+
+
+static int do_readahead(struct pseudo_file *file, long long current,
+		struct file_buffer *file_buffer, int size)
+{
+	int res;
+	long long readahead = current - file->current;
+
+	if(readahead_table == NULL) {
+		readahead_table = malloc(READAHEAD_ALLOC);
+		if(readahead_table == NULL)
+			MEM_ERROR();
+
+		memset(readahead_table, 0, READAHEAD_ALLOC);
+	}
+
+	while(readahead) {
+		int offset = READAHEAD_OFFSET(file->current);
+		int bytes = READAHEAD_SIZE - offset < readahead ? READAHEAD_SIZE - offset : readahead;
+		struct readahead *buffer = malloc(sizeof(struct readahead) + bytes);
+
+		if(buffer == NULL)
+			MEM_ERROR();
+
+		res = get_bytes(buffer->data, bytes);
+
+		if(res == -1) {
+			free(buffer);
+			return res;
+		}
+
+		buffer->start = file->current;
+		buffer->size = bytes;
+		buffer->src = buffer->data;
+		add_readahead(buffer);
+
+		file->current += bytes;
+		readahead -= bytes;
+	}
+
+	res = get_bytes(file_buffer->data, size);
+
+	if(res != -1)
+		file->current += size;
+
+	return res;
+}
+
+
+static int read_data(struct pseudo_file *file, long long current,
+		struct file_buffer *file_buffer, int size)
+{
+	int res;
+
+	if(file->fd != STDIN_FILENO) {
+		if(current != file->current) {
+			/*
+			 * File data reading is not in the same order as stored
+			 * in the pseudo file.  As this is not stdin, we can
+			 * lseek() to the wanted data
+			 */
+			res = lseek(file->fd, current + file->start, SEEK_SET);
+			if(res == -1)
+				BAD_ERROR("Lseek on pseudo file %s failed because %s\n",
+					file->filename, strerror(errno));
+
+			file->current = current;
+		}
+
+		res = read_bytes(file->fd, file_buffer->data, size);
+
+		if(res != -1)
+			file->current += size;
+
+		return res;
+	}
+
+	/*
+	 * Reading from stdin.  Three possibilities
+	 * 1. We are at the current place in stdin, so just read data
+	 * 2. Data we want has already been read and buffered (readahead).
+	 * 3. Data is later in the file, readahead and buffer data to that point
+	 */
+
+	if(current == file->current) {
+		res = get_bytes(file_buffer->data, size);
+
+		if(res != -1)
+			file->current += size;
+
+		return res;
+	} else if(current < file->current)
+		return get_readahead(file, current, file_buffer, size);
+	else
+		return do_readahead(file, current, file_buffer, size);
+}
+
+
 static void reader_read_data(struct dir_ent *dir_ent)
 {
 	struct file_buffer *file_buffer;
-	int blocks, res;
-	long long bytes, read_size;
+	int blocks;
+	long long bytes, read_size, current;
 	struct inode_info *inode = dir_ent->inode;
 	static struct pseudo_file *file = NULL;
 
@@ -361,41 +587,46 @@ static void reader_read_data(struct dir_ent *dir_ent)
 	if(inode->pseudo->data->file != file) {
 		/* Reading the first or a different pseudo file, if
 		 * a different one, first close the previous pseudo
-		 * file */
-		if(file && file->fd != -1) {
+		 * file, unless it is stdin */
+		if(file && file->fd > 0) {
 			close(file->fd);
 			file->fd = -1;
 		}
 
 		file = inode->pseudo->data->file;
 
-		while(1) {
-			file->fd = open(file->filename, O_RDONLY);
-			if(file->fd != -1 || errno != EINTR)
-				break;
-		}
+		if(file->fd == -1) {
+			while(1) {
+				file->fd = open(file->filename, O_RDONLY);
+				if(file->fd != -1 || errno != EINTR)
+					break;
+			}
 
-		if(file->fd == -1)
-			BAD_ERROR("Could not open pseudo file %s because %s\n", file->filename, strerror(errno));
+			if(file->fd == -1)
+				BAD_ERROR("Could not open pseudo file %s "
+					"because %s\n", file->filename,
+					strerror(errno));
+
+			file->current = -file->start;
+		}
 	}
 
-	res = lseek(file->fd, file->start + inode->pseudo->data->offset, SEEK_SET);
-	if(res == -1)
-		BAD_ERROR("Lseek on pseudo file %s failed because %s\n", file->filename, strerror(errno));
+	current = inode->pseudo->data->offset;
 
 	do {
 		file_buffer = cache_get_nohash(reader_buffer);
 		file_buffer->file_size = read_size;
-		file_buffer->sequence = seq ++;
+		file_buffer->sequence = sequence_count ++;
 		file_buffer->noD = inode->noD;
 		file_buffer->error = FALSE;
 
 		if(blocks > 1) {
 			/* non-tail block should be exactly block_size */
-			file_buffer->size = read_bytes(file->fd, file_buffer->data, block_size);
+			file_buffer->size = read_data(file, current, file_buffer, block_size);
 			if(file_buffer->size != block_size)
 				BAD_ERROR("Failed to read pseudo file %s, it appears to be truncated or corrupted\n", file->filename);
 
+			current += file_buffer->size;
 			bytes += file_buffer->size;
 
 			file_buffer->fragment = FALSE;
@@ -403,9 +634,11 @@ static void reader_read_data(struct dir_ent *dir_ent)
 		} else {
 			int expected = read_size - bytes;
 
-			file_buffer->size = read_bytes(file->fd, file_buffer->data, expected);
+			file_buffer->size = read_data(file, current, file_buffer, expected);
 			if(file_buffer->size != expected)
 				BAD_ERROR("Failed to read pseudo file %s, it appears to be truncated or corrupted\n", file->filename);
+
+			current += file_buffer->size;
 		}
 	} while(-- blocks > 0);
 
@@ -420,7 +653,8 @@ void reader_scan(struct dir_info *dir)
 
 	for(; dir_ent; dir_ent = dir_ent->next) {
 		struct stat *buf = &dir_ent->inode->buf;
-		if(dir_ent->inode->root_entry)
+
+		if(dir_ent->inode->root_entry || IS_TARFILE(dir_ent->inode))
 			continue;
 
 		if(IS_PSEUDO_PROCESS(dir_ent->inode)) {
@@ -460,9 +694,12 @@ void *reader(void *arg)
 		setitimer(ITIMER_REAL, &itimerval, NULL);
 	}
 
-	if(tarfile)
+	if(tarfile) {
 		read_tar_file();
-	else if(!sorted)
+		dir = queue_get(to_reader);
+	}
+
+	if(!sorted)
 		reader_scan(dir);
 	else{
 		int i;

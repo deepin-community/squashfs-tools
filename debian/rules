@@ -14,7 +14,9 @@ override_dh_auto_build:
 			ZSTD_SUPPORT=1 dh_auto_build
 
 override_dh_auto_install:
-	dh_auto_install -- INSTALL_DIR=$(CURDIR)/debian/squashfs-tools/usr/bin
+	dh_auto_install -- \
+		INSTALL_DIR=$(CURDIR)/debian/squashfs-tools/usr/bin \
+		INSTALL_MANPAGES_DIR=$(CURDIR)/debian/squashfs-tools/usr/share/man/man1
 
 %:
 	dh ${@} --sourcedirectory=squashfs-tools/

@@ -4,7 +4,7 @@
  * Squashfs
  *
  * Copyright (c) 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2009, 2010, 2011
- * 2012, 2013, 2014, 2019, 2021
+ * 2012, 2013, 2014, 2019, 2021, 2022, 2023
  * Phillip Lougher <phillip@squashfs.org.uk>
  *
  * This program is free software; you can redistribute it and/or
@@ -30,7 +30,7 @@ struct dir_info {
 	char			*subpath;
 	unsigned int		count;
 	unsigned int		directory_count;
-	int			depth;
+	unsigned int		depth;
 	unsigned int		excluded;
 	char			dir_is_ldir;
 	struct dir_ent		*dir_ent;
@@ -53,6 +53,7 @@ struct inode_info {
 	struct inode_info	*next;
 	struct pseudo_dev	*pseudo;
 	struct tar_file		*tar_file;
+	struct pseudo_xattr	*xattr;
 	squashfs_inode		inode;
 	unsigned int		inode_number;
 	unsigned int		nlink;
@@ -205,6 +206,10 @@ struct old_root_entry_info {
 
 #define ALLOC_SIZE 128
 
+/* Maximum transfer size for Linux read() call on both 32-bit and 64-bit systems.
+ * See READ(2) */
+#define MAXIMUM_READ_SIZE 0x7ffff000
+
 extern int sleep_time;
 extern struct cache *reader_buffer, *fragment_buffer, *reserve_cache;
 extern struct cache *bwriter_buffer, *fwriter_buffer;
@@ -231,7 +236,21 @@ extern struct pathnames *paths;
 extern int tarfile;
 extern int root_mode_opt;
 extern mode_t root_mode;
+extern int root_time_opt;
+extern unsigned int root_time;
+extern int root_uid_opt;
+extern unsigned int root_uid;
+extern int root_gid_opt;
+extern unsigned int root_gid;
 extern struct inode_info *inode_info[INODE_HASH_SIZE];
+extern int quiet;
+extern int sequence_count;
+extern int pseudo_override;
+extern int global_uid_opt;
+extern unsigned int global_uid;
+extern int global_gid_opt;
+extern unsigned int global_gid;
+extern int sleep_time;
 
 extern int read_fs_bytes(int, long long, long long, void *);
 extern void add_file(long long, long long, long long, unsigned int *, int,
@@ -257,9 +276,10 @@ extern void add_dir_entry(struct dir_ent *dir_ent, struct dir_info *sub_dir,
 	struct inode_info *inode_info);
 extern void free_dir_entry(struct dir_ent *dir_ent);
 extern void free_dir(struct dir_info *dir);
-extern struct dir_info *create_dir(char *pathname, char *subpath, int depth);
+extern struct dir_info *create_dir(char *pathname, char *subpath, unsigned int depth);
 extern char *subpathname(struct dir_ent *dir_ent);
-extern struct dir_info *scan1_opendir(char *pathname, char *subpath, int depth);
+extern struct dir_info *scan1_opendir(char *pathname, char *subpath, unsigned int depth);
 extern squashfs_inode do_directory_scans(struct dir_ent *dir_ent, int progress);
 extern struct inode_info *lookup_inode(struct stat *buf);
+extern int exec_date(char *, unsigned int *);
 #endif

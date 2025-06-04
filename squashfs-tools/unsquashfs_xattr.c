@@ -2,7 +2,7 @@
  * Unsquash a squashfs filesystem.  This is a highly compressed read only
  * filesystem.
  *
- * Copyright (c) 2010, 2012, 2019, 2021
+ * Copyright (c) 2010, 2012, 2019, 2021, 2022
  * Phillip Lougher <phillip@squashfs.org.uk>
  *
  * This program is free software; you can redistribute it and/or
@@ -27,12 +27,127 @@
 
 #include <sys/xattr.h>
 
+#ifdef XATTR_NOFOLLOW /* Apple's xattrs */
+	#define lsetxattr(path_, name_, val_, sz_, flags_) \
+		setxattr(path_, name_, val_, sz_, 0, flags_ | XATTR_NOFOLLOW)
+#endif
+
 #define NOSPACE_MAX 10
 
 extern int root_process;
-extern int user_xattrs;
 extern int ignore_errors;
 extern int strict_errors;
+extern regex_t *xattr_exclude_preg;
+extern regex_t *xattr_include_preg;
+
+int has_xattrs(unsigned int xattr)
+{
+	if(xattr == SQUASHFS_INVALID_XATTR ||
+			sBlk.s.xattr_id_table_start == SQUASHFS_INVALID_BLK)
+		return FALSE;
+	else
+		return TRUE;
+}
+
+
+static void print_xattr_name_value(struct xattr_list *xattr, int writer_fd)
+{
+	unsigned char *value = xattr->value;
+	int i, count = 0, printable = TRUE, res;
+
+	for(i = 0; i < xattr->vsize; i++) {
+		if(value[i] < 32 || value[i] > 126) {
+			printable = FALSE;
+			count += 4;
+		} else if(value[i] == '\\')
+			count += 4;
+		else
+			count ++;
+	}
+
+	if(!printable) {
+		unsigned char *new = malloc(count + 2), *dest;
+		if(new == NULL)
+			MEM_ERROR();
+
+		memcpy(new, "0t", 2);
+		count += 2;
+
+		for(dest = new + 2, i = 0; i < xattr->vsize; i++) {
+			if(value[i] < 32 || value[i] > 126 || value[i] == '\\') {
+				sprintf((char *) dest, "\\%03o", value[i]);
+				dest += 4;
+			} else
+				*dest ++ = value[i];
+		}
+
+		value = new;
+	} else
+		count = xattr->vsize;
+	
+	res = dprintf(writer_fd, "%s=", xattr->full_name);
+	if(res == -1)
+		EXIT_UNSQUASH("Failed to write to pseudo output file\n");
+
+	res = write_bytes(writer_fd, (char *) value, count);
+	if(res == -1)
+		EXIT_UNSQUASH("Failed to write to pseudo output file\n");
+
+	res = dprintf(writer_fd, "\n");
+	if(res == -1)
+		EXIT_UNSQUASH("Failed to write to pseudo output file\n");
+
+	if(!printable)
+		free(value);
+}
+
+
+void print_xattr(char *pathname, unsigned int xattr, int writer_fd)
+{
+	unsigned int count;
+	struct xattr_list *xattr_list;
+	int i, failed, res;
+
+	if(!has_xattrs(xattr))
+		return;
+
+	if(xattr >= sBlk.xattr_ids)
+		EXIT_UNSQUASH("File system corrupted - xattr index in inode too large (xattr: %u)\n", xattr);
+
+	xattr_list = get_xattr(xattr, &count, &failed);
+	if(xattr_list == NULL && failed == FALSE)
+		exit(1);
+
+	if(failed)
+		EXIT_UNSQUASH_STRICT("write_xattr: Failed to read one or more xattrs for %s\n", pathname);
+
+	for(i = 0; i < count; i++) {
+		if(xattr_exclude_preg) {
+			int res = regexec(xattr_exclude_preg,
+				xattr_list[i].full_name, (size_t) 0, NULL, 0);
+
+			if(res == 0)
+				continue;
+		}
+
+		if(xattr_include_preg) {
+			int res = regexec(xattr_include_preg,
+				xattr_list[i].full_name, (size_t) 0, NULL, 0);
+
+			if(res)
+				continue;
+		}
+
+		res = dprintf(writer_fd, "%s x ", pathname);
+		if(res == -1)
+			EXIT_UNSQUASH("Failed to write to pseudo output file\n");
+
+		print_xattr_name_value(&xattr_list[i], writer_fd);
+	}
+
+	free_xattr(xattr_list, count);
+}
+
 
 int write_xattr(char *pathname, unsigned int xattr)
 {
@@ -44,9 +159,11 @@ int write_xattr(char *pathname, unsigned int xattr)
 	static int nospace_error = 0;
 	int failed;
 
-	if(ignore_xattrs || xattr == SQUASHFS_INVALID_XATTR ||
-			sBlk.s.xattr_id_table_start == SQUASHFS_INVALID_BLK)
+	if(ignore_xattrs || !has_xattrs(xattr))
 		return TRUE;
+
+	if(xattr >= sBlk.xattr_ids)
+		EXIT_UNSQUASH("File system corrupted - xattr index in inode too large (xattr: %u)\n", xattr);
 
 	xattr_list = get_xattr(xattr, &count, &failed);
 	if(xattr_list == NULL && failed == FALSE)
@@ -58,8 +175,24 @@ int write_xattr(char *pathname, unsigned int xattr)
 	for(i = 0; i < count; i++) {
 		int prefix = xattr_list[i].type & SQUASHFS_XATTR_PREFIX_MASK;
 
-		if(ignore_xattrs || (user_xattrs && prefix != SQUASHFS_XATTR_USER))
+		if(ignore_xattrs)
 			continue;
+
+		if(xattr_exclude_preg) {
+			int res = regexec(xattr_exclude_preg,
+				xattr_list[i].full_name, (size_t) 0, NULL, 0);
+
+			if(res == 0)
+				continue;
+		}
+
+		if(xattr_include_preg) {
+			int res = regexec(xattr_include_preg,
+				xattr_list[i].full_name, (size_t) 0, NULL, 0);
+
+			if(res)
+				continue;
+		}
 
 		if(root_process || prefix == SQUASHFS_XATTR_USER) {
 			int res = lsetxattr(pathname, xattr_list[i].full_name,
@@ -132,7 +265,7 @@ int write_xattr(char *pathname, unsigned int xattr)
 					"superuser!\n",
 					xattr_list[i].full_name, pathname);
 			EXIT_UNSQUASH_STRICT("write_xattr: to avoid this error message, either"
-				" specify -user-xattrs, -no-xattrs, or run as "
+				" specify -xattrs-include '^user.', -no-xattrs, or run as "
 				"superuser!\n");
 			ERROR("Further error messages of this type are "
 				"suppressed!\n");
@@ -144,4 +277,26 @@ int write_xattr(char *pathname, unsigned int xattr)
 	free_xattr(xattr_list, count);
 
 	return !failed;
+}
+
+
+regex_t *xattr_regex(char *pattern, char *option)
+{
+	int error;
+	regex_t *preg = malloc(sizeof(regex_t));
+
+	if(preg == NULL)
+		MEM_ERROR();
+
+	error = regcomp(preg, pattern, REG_EXTENDED|REG_NOSUB);
+
+	if(error) {
+		char str[1024]; /* overflow safe */
+
+		regerror(error, preg, str, 1024);
+		BAD_ERROR("invalid regex %s in xattrs-%s option, because %s\n",
+				pattern, option, str);
+	}
+
+	return preg;
 }

@@ -2,7 +2,7 @@
  * Create a squashfs filesystem.  This is a highly compressed read only
  * filesystem.
  *
- * Copyright (c) 2011, 2012, 2013, 2014, 2021
+ * Copyright (c) 2011, 2012, 2013, 2014, 2021, 2022
  * Phillip Lougher <phillip@squashfs.org.uk>
  *
  * This program is free software; you can redistribute it and/or
@@ -44,6 +44,7 @@
 #include "action.h"
 #include "mksquashfs_error.h"
 #include "fnmatch_compat.h"
+#include "xattr.h"
 
 #define TRUE 1
 #define FALSE 0
@@ -59,12 +60,18 @@ static struct action *exclude_spec = NULL;
 static struct action *empty_spec = NULL;
 static struct action *move_spec = NULL;
 static struct action *prune_spec = NULL;
+static struct action *xattr_exc_spec = NULL;
+static struct action *xattr_inc_spec = NULL;
+static struct action *xattr_add_spec = NULL;
 static struct action *other_spec = NULL;
 static int fragment_count = 0;
 static int exclude_count = 0;
 static int empty_count = 0;
 static int move_count = 0;
 static int prune_count = 0;
+static int xattr_exc_count = 0;
+static int xattr_inc_count = 0;
+static int xattr_add_count = 0;
 static int other_count = 0;
 static struct action_entry *parsing_action;
 
@@ -282,6 +289,7 @@ static int get_token(char **string)
 
 		if(cur_size + 2 > size) {
 			char *tmp;
+			int offset = str_ptr - str;
 
 			size = (cur_size + 1  + STR_SIZE) & ~(STR_SIZE - 1);
 
@@ -289,7 +297,7 @@ static int get_token(char **string)
 			if(tmp == NULL)
 				MEM_ERROR();
 
-			str_ptr = str_ptr - str + tmp;
+			str_ptr = tmp + offset;
 			str = tmp;
 		}
 
@@ -687,6 +695,18 @@ skip_args:
 		spec_count = prune_count ++;
 		spec_list = &prune_spec;
 		break;
+	case XATTR_EXC_ACTION:
+		spec_count = xattr_exc_count ++;
+		spec_list = &xattr_exc_spec;
+		break;
+	case XATTR_INC_ACTION:
+		spec_count = xattr_inc_count ++;
+		spec_list = &xattr_inc_spec;
+		break;
+	case XATTR_ADD_ACTION:
+		spec_count = xattr_add_count ++;
+		spec_list = &xattr_add_spec;
+		break;
 	default:
 		spec_count = other_count ++;
 		spec_list = &other_spec;
@@ -724,7 +744,7 @@ failed:
 #define LOG_PRINT	2
 #define LOG_ENABLED	3
 
-char *_expr_log(char *string, int cmnd)
+static char *_expr_log(char *string, int cmnd)
 {
 	static char *expr_msg = NULL;
 	static int cur_size = 0, alloc_size = 0;
@@ -767,19 +787,19 @@ char *_expr_log(char *string, int cmnd)
 }
 
 
-char *expr_log_cmnd(int cmnd)
+static char *expr_log_cmnd(int cmnd)
 {
 	return _expr_log(NULL, cmnd);
 }
 
 
-char *expr_log(char *string)
+static char *expr_log(char *string)
 {
 	return _expr_log(string, LOG_PRINT);
 }
 
 
-void expr_log_atom(struct atom *atom)
+static void expr_log_atom(struct atom *atom)
 {
 	int i;
 
@@ -800,7 +820,7 @@ void expr_log_atom(struct atom *atom)
 }
 
 
-void expr_log_match(int match)
+static void expr_log_match(int match)
 {
 	if(match)
 		expr_log("=True");
@@ -918,25 +938,25 @@ static int eval_expr_top(struct action *action, struct action_data *action_data)
  * 
  * Blank lines and comment lines indicated by # are supported.
  */
-int parse_action_true(char *s)
+static int parse_action_true(char *s)
 {
 	return parse_action(s, ACTION_LOG_TRUE);
 }
 
 
-int parse_action_false(char *s)
+static int parse_action_false(char *s)
 {
 	return parse_action(s, ACTION_LOG_FALSE);
 }
 
 
-int parse_action_verbose(char *s)
+static int parse_action_verbose(char *s)
 {
 	return parse_action(s, ACTION_LOG_VERBOSE);
 }
 
 
-int parse_action_nonverbose(char *s)
+static int parse_action_nonverbose(char *s)
 {
 	return parse_action(s, ACTION_LOG_NONE);
 }
@@ -1099,7 +1119,7 @@ int exclude_actions()
 
 
 int eval_exclude_actions(char *name, char *pathname, char *subpath,
-	struct stat *buf, int depth, struct dir_ent *dir_ent)
+	struct stat *buf, unsigned int depth, struct dir_ent *dir_ent)
 {
 	int i, match = 0;
 	struct action_data action_data;
@@ -2133,6 +2153,182 @@ int eval_prune_actions(struct dir_info *root, struct dir_ent *dir_ent)
 
 
 /*
+ * Xattr include/exclude specific action code
+ */
+static int parse_xattr_args(struct action_entry *action, int args,
+					char **argv, void **data)
+{
+	struct xattr_data *xattr_data;
+	int error;
+
+	xattr_data = malloc(sizeof(*xattr_data));
+	if (xattr_data == NULL)
+		MEM_ERROR();
+
+	error = regcomp(&xattr_data->preg, argv[0], REG_EXTENDED|REG_NOSUB);
+	if(error) {
+		char str[1024]; /* overflow safe */
+
+		regerror(error, &xattr_data->preg, str, 1024);
+		SYNTAX_ERROR("invalid regex %s because %s\n", argv[0], str);
+		free(xattr_data);
+		return 0;
+	}
+
+	*data = xattr_data;
+
+	return 1;
+}
+
+
+static struct xattr_data *eval_xattr_actions (struct action *spec,
+		int count, struct dir_info *root, struct dir_ent *dir_ent)
+{
+	int i;
+	struct action_data action_data;
+	struct xattr_data *head = NULL;
+
+	if(count == 0)
+		return NULL;
+
+	action_data.name = dir_ent->name;
+	action_data.pathname = strdup(pathname(dir_ent));
+	action_data.subpath = strdup(subpathname(dir_ent));
+	action_data.buf = &dir_ent->inode->buf;
+	action_data.depth = dir_ent->our_dir->depth;
+	action_data.dir_ent = dir_ent;
+	action_data.root = root;
+
+	for (i = 0; i < count; i++) {
+		struct xattr_data *data = spec[i].data;
+		int match = eval_expr_top(&spec[i], &action_data);
+
+		if(match) {
+			data->next = head;
+			head = data;
+		}
+	}
+
+	free(action_data.pathname);
+	free(action_data.subpath);
+
+	return head;
+}
+
+
+int xattr_exc_actions()
+{
+	return xattr_exc_count;
+}
+
+
+struct xattr_data *eval_xattr_exc_actions (struct dir_info *root,
+					struct dir_ent *dir_ent)
+{
+	return eval_xattr_actions(xattr_exc_spec, xattr_exc_count, root, dir_ent);
+}
+
+
+int match_xattr_exc_actions(struct xattr_data *head, char *name)
+{
+	struct xattr_data *cur;
+
+	for(cur = head; cur != NULL; cur = cur->next) {
+		int match = regexec(&cur->preg, name, (size_t) 0, NULL, 0);
+
+		if(match == 0)
+			return 1;
+	}
+
+	return 0;
+}
+
+
+int xattr_inc_actions()
+{
+	return xattr_inc_count;
+}
+
+
+struct xattr_data *eval_xattr_inc_actions (struct dir_info *root,
+					struct dir_ent *dir_ent)
+{
+	return eval_xattr_actions(xattr_inc_spec, xattr_inc_count, root, dir_ent);
+}
+
+
+int match_xattr_inc_actions(struct xattr_data *head, char *name)
+{
+	if(head == NULL)
+		return 0;
+	else
+		return !match_xattr_exc_actions(head, name);
+}
+
+
+/*
+ * Xattr add specific action code
+ */
+static int parse_xattr_add_args(struct action_entry *action, int args,
+					char **argv, void **data)
+{
+	struct xattr_add *xattr = xattr_parse(argv[0], "", "action xattr add");
+
+	if(xattr == NULL)
+		return 0;
+
+	*data = xattr;
+
+	return 1;
+}
+
+
+struct xattr_add *eval_xattr_add_actions(struct dir_info *root,
+					struct dir_ent *dir_ent, int *items)
+{
+	int i, count = 0;
+	struct action_data action_data;
+	struct xattr_add *head = NULL;
+
+	if(xattr_add_count == 0) {
+		*items = 0;
+		return NULL;
+	}
+
+	action_data.name = dir_ent->name;
+	action_data.pathname = strdup(pathname(dir_ent));
+	action_data.subpath = strdup(subpathname(dir_ent));
+	action_data.buf = &dir_ent->inode->buf;
+	action_data.depth = dir_ent->our_dir->depth;
+	action_data.dir_ent = dir_ent;
+	action_data.root = root;
+
+	for (i = 0; i < xattr_add_count; i++) {
+		struct xattr_add *data = xattr_add_spec[i].data;
+		int match = eval_expr_top(&xattr_add_spec[i], &action_data);
+
+		if(match) {
+			data->next = head;
+			head = data;
+			count ++;
+		}
+	}
+
+	free(action_data.pathname);
+	free(action_data.subpath);
+
+	*items = count;
+	return head;
+}
+
+
+int xattr_add_actions()
+{
+	return xattr_add_count;
+}
+
+
+/*
  * Noop specific action code
  */
 static void noop_action(struct action *action, struct dir_ent *dir_ent)
@@ -2412,11 +2608,14 @@ static char *get_start(char *s, int n)
 }
 	
 
-static int subpathname_fn(struct atom *atom, struct action_data *action_data)
+static int subpathname_fn(struct atom *atom, struct action_data *data)
 {
-	return fnmatch(atom->argv[0], get_start(strdupa(action_data->subpath),
-		count_components(atom->argv[0])),
-		FNM_PATHNAME|FNM_EXTMATCH) == 0;
+	char *s = get_start(strdup(data->subpath), count_components(atom->argv[0]));
+	int res = fnmatch(atom->argv[0], s, FNM_PATHNAME|FNM_EXTMATCH);
+
+	free(s);
+
+	return res == 0;
 }
 
 /*
@@ -2538,7 +2737,7 @@ static int parse_group_arg(struct test_entry *test, struct atom *atom)
 /*
  * Type test specific code
  */
-struct type_entry type_table[] = {
+static struct type_entry type_table[] = {
 	{ S_IFSOCK, 's' },
 	{ S_IFLNK, 'l' },
 	{ S_IFREG, 'f' },
@@ -3367,6 +3566,9 @@ static struct action_entry action_table[] = {
 	{ "move", MOVE_ACTION, 1, ACTION_ALL_LNK, NULL, NULL},
 	{ "prune", PRUNE_ACTION, 0, ACTION_ALL_LNK, NULL, NULL},
 	{ "chmod", MODE_ACTION, -2, ACTION_ALL, parse_mode_args, mode_action },
+	{ "xattrs-exclude", XATTR_EXC_ACTION, 1, ACTION_ALL, parse_xattr_args, NULL},
+	{ "xattrs-include", XATTR_INC_ACTION, 1, ACTION_ALL, parse_xattr_args, NULL},
+	{ "xattrs-add", XATTR_ADD_ACTION, 1, ACTION_ALL, parse_xattr_add_args, NULL},
 	{ "noop", NOOP_ACTION, 0, ACTION_ALL, NULL, noop_action },
 	{ "", 0, -1, 0, NULL, NULL}
 };

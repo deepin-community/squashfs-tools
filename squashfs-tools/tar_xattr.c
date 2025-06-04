@@ -1,7 +1,7 @@
 /*
  * Squashfs
  *
- * Copyright (c) 2021
+ * Copyright (c) 2021, 2022
  * Phillip Lougher <phillip@squashfs.org.uk>
  *
  * This program is free software; you can redistribute it and/or
@@ -21,16 +21,12 @@
  * tar_xattr.c
  */
 
-#include <stdio.h>
-#include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
 #include <dirent.h>
 #include <sys/stat.h>
 #include <sys/types.h>
-#include <pwd.h>
-#include <grp.h>
-#include <time.h>
+#include <regex.h>
 
 #include "squashfs_fs.h"
 #include "mksquashfs.h"
@@ -41,72 +37,8 @@
 #define TRUE 1
 #define FALSE 0
 
-
-static char *base64_decode(char *source, int size, int *bytes)
-{
-	char *dest;
-	unsigned char *dest_ptr, *source_ptr = (unsigned char *) source;
-	int bit_pos = 0;
-	int output = 0;
-	int count;
-
-	/* Calculate number of bytes the base64 encoding represents */
-	count = size * 3 / 4;
-
-	dest = malloc(count);
-
-	for(dest_ptr = (unsigned char *) dest; size; size --, source_ptr ++) {
-		int value = *source_ptr;
-
-		if(value >= 'A' && value <= 'Z')
-			value -= 'A';
-		else if(value >= 'a' && value <= 'z')
-			value -= 'a' - 26;
-		else if(value >= '0' && value <= '9')
-			value -= '0' - 52;
-		else if(value == '+')
-			value = 62;
-		else if(value == '/')
-			value = 63;
-		else {
-			ERROR("Invalid character in LIBARCHIVE xattr base64 value, ignoring\n");
-			free(dest);
-			return NULL;
-		}
-
-		if(bit_pos == 24) {
-			dest_ptr[0] = output >> 16;
-			dest_ptr[1] = (output >> 8) & 0xff;
-			dest_ptr[2] = output & 0xff;
-			bit_pos = 0;
-			output = 0;
-			dest_ptr += 3;
-		}
-
-		output = (output << 6) | value;
-		bit_pos += 6;
-	}
-
-	output = output << (24 - bit_pos);
-
-	if(bit_pos == 6) {
-		ERROR("Invalid length in LIBARCHIVE xattr base64 value, ignoring\n");
-		free(dest);
-		return NULL;
-	}
-
-	if(bit_pos >= 12)
-		dest_ptr[0] = output >> 16;
-
-	if(bit_pos >= 18)
-		dest_ptr[1] = (output >> 8) & 0xff;
-
-	if(bit_pos == 24)
-		dest_ptr[2] = output & 0xff;
-
-	*bytes = (dest_ptr - (unsigned char *) dest) + (bit_pos / 8);
-	return dest;
-}
+extern regex_t *xattr_exclude_preg;
+extern regex_t *xattr_include_preg;
 
 
 void read_tar_xattr(char *name, char *value, int size, int encoding, struct tar_file *file)
@@ -122,10 +54,26 @@ void read_tar_xattr(char *name, char *value, int size, int encoding, struct tar_
 		if(strcmp(name, file->xattr_list[i].full_name) == 0)
 			return;
 
+	if(xattr_exclude_preg) {
+		int res = regexec(xattr_exclude_preg, name, (size_t) 0, NULL, 0);
+
+		if(res == 0)
+			return;
+	}
+
+	if(xattr_include_preg) {
+		int res = regexec(xattr_include_preg, name, (size_t) 0, NULL, 0);
+
+		if(res)
+			return;
+	}
+
 	if(encoding == ENCODING_BASE64) {
 		data = base64_decode(value, size, &size);
-		if(data == NULL)
+		if(data == NULL) {
+			ERROR("Invalid LIBARCHIVE xattr base64 value, ignoring\n");
 			return;
+		}
 	} else {
 		data = malloc(size);
 		if(data == NULL)
@@ -143,7 +91,6 @@ void read_tar_xattr(char *name, char *value, int size, int encoding, struct tar_
 	xattr->type = xattr_get_prefix(xattr, name);
 	if(xattr->type == -1) {
 		ERROR("Unrecognised tar xattr prefix %s, ignoring\n", name);
-		free(xattr->full_name);
 		free(data);
 		return;
 	}

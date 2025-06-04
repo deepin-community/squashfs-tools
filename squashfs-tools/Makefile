@@ -1,12 +1,15 @@
-# Squashfs-tools 4.5 release
-RELEASE_VERSION = 4.5
-RELEASE_DATE = 2021/07/22
-
+# Squashfs-tools 4.6.1 release
+RELEASE_VERSION = 4.6.1
+RELEASE_DATE = 2023/03/25
 ###############################################
-#          Compression build options          #
+#                Build options                #
 ###############################################
 #
+# Edit the following definitions to customise the build, or run
+# "CONFIG=1 make" with the build options below to customise the build on
+# the command line.
 #
+ifndef CONFIG
 ############# Building gzip support ###########
 #
 # Gzip support is by default enabled, and the compression type default
@@ -16,8 +19,8 @@ RELEASE_DATE = 2021/07/22
 # below, and change COMP_DEFAULT to one of the compression types you have
 # selected.
 #
-# Obviously, you must select at least one of the available gzip, lzma, lzo
-# compression types.
+# Obviously, you must select at least one of the available gzip, xz, lzo,
+# lz4, zstd or lzma (deprecated) compression types.
 #
 GZIP_SUPPORT = 1
 
@@ -122,6 +125,36 @@ XATTR_DEFAULT = 1
 # -reproducible option
 REPRODUCIBLE_DEFAULT = 1
 
+###############################################
+#               Manpage generation            #
+###############################################
+#
+# If help2man is available on the system, on installation, the Makefile
+# will try to generate "custom" manpages from the built squashfs-tools.
+#
+# If the squashfs-tools have been cross-compiled, or for any other
+# reason they're not executable, this will generate errors at
+# installation and the install script will fall back to using
+# pre-built manpages.
+#
+# Change next variable to "y" to use the pre-built manpages by default,
+# and not attempt to generate "custom" manpages.  This will eliminate
+# errors and warnings at install time.
+USE_PREBUILT_MANPAGES=n
+
+###############################################
+#              INSTALL PATHS                  #
+###############################################
+#
+# Alter INSTALL_* to install binaries and manpages
+# elsewhere.
+#
+# To skip building and installing manpages,
+# unset INSTALL_MANPAGES_DIR or set to ""
+#
+INSTALL_PREFIX = /usr/local
+INSTALL_DIR = $(INSTALL_PREFIX)/bin
+INSTALL_MANPAGES_DIR = $(INSTALL_PREFIX)/man/man1
 
 ###############################################
 #              Obsolete options               #
@@ -147,21 +180,39 @@ REPRODUCIBLE_DEFAULT = 1
 #LZMA_XZ_SUPPORT = 1
 #LZMA_SUPPORT = 1
 #LZMA_DIR = ../../../../LZMA/lzma465
+else
+GZIP_SUPPORT ?= 1
+ZX_SUPPORT ?= 0
+LZO_SUPPORT ?= 0
+LZ4_SUPPORT ?= 0
+ZSTD_SUPPORT ?= 0
+COMP_DEFAULT ?= gzip
+XATTR_SUPPORT ?= 1
+XATTR_DEFAULT ?= 1
+REPRODUCIBLE_DEFAULT ?= 1
+USE_PREBUILT_MANPAGES ?= 1
+INSTALL_PREFIX ?= /usr/local
+INSTALL_DIR ?= $(INSTALL_PREFIX)/bin
+INSTALL_MANPAGES_DIR ?= $(INSTALL_PREFIX)/man/man1
+LZMA_XZ_SUPPORT ?= 0
+LZMA_SUPPORT ?= 0
+LZMA_DIR ?= ../../../../LZMA/lzma465
+endif
+
 
 ###############################################
 #        End of BUILD options section         #
 ###############################################
-
+#
 INCLUDEDIR = -I.
-INSTALL_DIR = /usr/local/bin
 
 MKSQUASHFS_OBJS = mksquashfs.o read_fs.o action.o swap.o pseudo.o compressor.o \
 	sort.o progressbar.o info.o restore.o process_fragments.o \
-	caches-queues-lists.o reader.o tar.o
+	caches-queues-lists.o reader.o tar.o date.o
 
 UNSQUASHFS_OBJS = unsquashfs.o unsquash-1.o unsquash-2.o unsquash-3.o \
-	unsquash-4.o unsquash-123.o unsquash-34.o unsquash-1234.o swap.o \
-	compressor.o unsquashfs_info.o
+	unsquash-4.o unsquash-123.o unsquash-34.o unsquash-1234.o unsquash-12.o \
+	swap.o compressor.o unsquashfs_info.o date.o
 
 CFLAGS ?= -O2
 CFLAGS += $(EXTRA_CFLAGS) $(INCLUDEDIR) -D_FILE_OFFSET_BITS=64 \
@@ -207,7 +258,7 @@ ifeq ($(LZO_SUPPORT),1)
 CFLAGS += -DLZO_SUPPORT
 MKSQUASHFS_OBJS += lzo_wrapper.o
 UNSQUASHFS_OBJS += lzo_wrapper.o
-LIBS += $(LZO_LIBDIR) -llzo2
+LIBS += -llzo2
 COMPRESSORS += lzo
 endif
 
@@ -233,7 +284,7 @@ CFLAGS += -DXATTR_SUPPORT -DXATTR_DEFAULT
 else
 CFLAGS += -DXATTR_SUPPORT
 endif
-MKSQUASHFS_OBJS += xattr.o read_xattrs.o tar_xattr.o
+MKSQUASHFS_OBJS += xattr.o read_xattrs.o tar_xattr.o pseudo_xattr.o
 UNSQUASHFS_OBJS += read_xattrs.o unsquashfs_xattr.o
 endif
 
@@ -301,15 +352,17 @@ VERSION := $(RELEASE_VERSION)
 DATE := $(RELEASE_DATE)
 else
 ifeq ($(HASH),$Format:%h$)
-VERSION := 4.4-$(shell git show -s --pretty=format:%h)
+VERSION := 4.6.1-$(shell git show -s --pretty=format:%h)
 DATE := $(firstword $(subst -,/,$(shell git show -s --pretty=format:%ci)))
 else
-VERSION := 4.4-$(HASH)
+VERSION := 4.6-$(HASH)
 DATE := $(firstword $(FULLDATE))
 endif
 endif
 
-CFLAGS += -DVERSION=\"$(VERSION)\" -DDATE=\"$(DATE)\"
+YEAR := $(firstword $(subst /, , $(DATE)))
+
+CFLAGS += -DVERSION=\"$(VERSION)\" -DDATE=\"$(DATE)\" -DYEAR=\"$(YEAR)\"
 
 .PHONY: all
 all: mksquashfs unsquashfs
@@ -333,6 +386,8 @@ sort.o: sort.c squashfs_fs.h mksquashfs.h sort.h mksquashfs_error.h progressbar.
 swap.o: swap.c
 
 pseudo.o: pseudo.c pseudo.h mksquashfs_error.h progressbar.h
+
+pseudo_xattr.o: pseudo_xattr.c xattr.h mksquashfs_error.h progressbar.h
 
 compressor.o: Makefile compressor.c compressor.h squashfs_fs.h
 
@@ -358,6 +413,8 @@ caches-queues-lists.o: caches-queues-lists.c mksquashfs_error.h caches-queues-li
 tar.o: tar.h
 
 tar_xattr.o: tar.h xattr.h
+
+date.o: date.h error.h
 
 gzip_wrapper.o: gzip_wrapper.c squashfs_fs.h gzip_wrapper.h compressor.h
 
@@ -393,18 +450,21 @@ unsquash-34.o: unsquashfs.h unsquash-34.c unsquashfs_error.h
 
 unsquash-1234.o: unsquash-1234.c unsquashfs_error.h
 
+unsquash-12.o: unsquash-12.c unsquashfs.h
+
 unsquashfs_xattr.o: unsquashfs_xattr.c unsquashfs.h squashfs_fs.h xattr.h unsquashfs_error.h
 
 unsquashfs_info.o: unsquashfs.h squashfs_fs.h unsquashfs_error.h
 
 .PHONY: clean
 clean:
-	-rm -f *.o mksquashfs unsquashfs sqfstar sqfscat
+	-rm -f *.o mksquashfs unsquashfs sqfstar sqfscat *.1
 
 .PHONY: install
 install: mksquashfs unsquashfs
 	mkdir -p $(INSTALL_DIR)
 	cp mksquashfs $(INSTALL_DIR)
 	cp unsquashfs $(INSTALL_DIR)
-	ln -fs $(INSTALL_DIR)/unsquashfs $(INSTALL_DIR)/sqfscat
-	ln -fs $(INSTALL_DIR)/mksquashfs $(INSTALL_DIR)/sqfstar
+	ln -fs unsquashfs $(INSTALL_DIR)/sqfscat
+	ln -fs mksquashfs $(INSTALL_DIR)/sqfstar
+	../generate-manpages/install-manpages.sh $(shell pwd)/.. "$(INSTALL_MANPAGES_DIR)" "$(USE_PREBUILT_MANPAGES)"

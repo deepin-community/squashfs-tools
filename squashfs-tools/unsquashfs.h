@@ -4,7 +4,7 @@
  * Unsquash a squashfs filesystem.  This is a highly compressed read only
  * filesystem.
  *
- * Copyright (c) 2009, 2010, 2013, 2014, 2019, 2021
+ * Copyright (c) 2009, 2010, 2013, 2014, 2019, 2021, 2022, 2023
  * Phillip Lougher <phillip@squashfs.org.uk>
  *
  * This program is free software; you can redistribute it and/or
@@ -62,6 +62,8 @@ struct super_block {
 	unsigned int		no_guids;
 	long long		uid_start;
 	long long		guid_start;
+	/* fields only used by squashfs 4 */
+	unsigned int		xattr_ids;
 };
 
 
@@ -164,21 +166,22 @@ struct queue {
 #define DIR_ENT_SIZE	16
 
 struct dir_ent	{
-	char		name[SQUASHFS_NAME_LEN + 1];
+	char		*name;
 	unsigned int	start_block;
 	unsigned int	offset;
 	unsigned int	type;
+	struct dir_ent	*next;
 };
 
 struct dir {
 	int		dir_count;
-	int 		cur_entry;
 	unsigned int	mode;
 	uid_t		uid;
 	gid_t		guid;
 	unsigned int	mtime;
 	unsigned int	xattr;
 	struct dir_ent	*dirs;
+	struct dir_ent	*cur_entry;
 };
 
 struct file_entry {
@@ -246,6 +249,38 @@ struct directory_stack {
 
 #define MAX_FOLLOW_SYMLINKS 256
 
+/* These macros implement a bit-table to track whether directories have been
+ * already visited.  This is to trap corrupted filesystems which have multiple
+ * links to the same directory, which is invalid, and which may also create
+ * a directory loop, where Unsquashfs will endlessly recurse until either
+ * the pathname is too large (extracting), or the stack overflows.
+ *
+ * Each index entry is 8 Kbytes, and tracks 65536 inode numbers.  The index is
+ * allocated on demand because Unsquashfs may not walk the complete filesystem.
+ */
+#define INUMBER_INDEXES(INODES)		((((INODES) - 1) >> 16) + 1)
+#define INUMBER_INDEX(NUMBER)		((NUMBER) >> 16)
+#define INUMBER_OFFSET(NUMBER)		(((NUMBER) & 0xffff) >> 5)
+#define INUMBER_BIT(NUMBER)		(1 << ((NUMBER) & 0x1f))
+#define INUMBER_BYTES			8192
+
+/* These macros implement a lookup table to track creation of (non-directory)
+ * inodes, and to discover if a hard-link to a previously created file should
+ * be made.
+ *
+ * Each index entry is 32 Kbytes, and tracks 4096 inode numbers.  The index is
+ * allocated on demand because Unsquashfs may not walk the complete filesystem.
+ */
+#define LOOKUP_INDEXES(INODES)		((((INODES) - 1) >> 12) + 1)
+#define LOOKUP_INDEX(NUMBER)		((NUMBER) >> 12)
+#define LOOKUP_OFFSET(NUMBER)		((NUMBER) & 0xfff)
+#define LOOKUP_BYTES			32768
+#define LOOKUP_OFFSETS			4096
+
+/* Maximum transfer size for Linux read() call on both 32-bit and 64-bit systems.
+ * See READ(2) */
+#define MAXIMUM_READ_SIZE 0x7ffff000
+
 /* globals */
 extern struct super_block sBlk;
 extern int swap;
@@ -260,16 +295,19 @@ extern struct queue *to_reader, *to_inflate, *to_writer;
 extern struct cache *fragment_cache, *data_cache;
 extern struct compressor *comp;
 extern int use_localtime;
+extern unsigned int timeval;
+extern int time_opt;
 
 /* unsquashfs.c */
 extern int read_inode_data(void *, long long *, unsigned int *, int);
 extern int read_directory_data(void *, long long *, unsigned int *, int);
-extern int read_fs_bytes(int fd, long long, int, void *);
+extern int read_fs_bytes(int fd, long long, long long, void *);
 extern int read_block(int, long long, long long *, int, void *);
 extern void enable_progress_bar();
 extern void disable_progress_bar();
 extern void dump_queue(struct queue *);
 extern void dump_cache(struct cache *);
+extern int write_bytes(int, char *, int);
 
 /* unsquash-1.c */
 int read_super_1(squashfs_operations **, void *);
@@ -288,7 +326,20 @@ extern int read_ids(int, long long, long long, unsigned int **);
 
 /* unsquash-34.c */
 extern long long *alloc_index_table(int);
+extern int inumber_lookup(unsigned int);
+extern void free_inumber_table();
+extern char *lookup(unsigned int);
+extern void insert_lookup(unsigned int, char *);
+extern void free_lookup_table(int);
 
 /* unsquash-1234.c */
 extern int check_name(char *, int);
+extern void squashfs_closedir(struct dir *);
+extern int check_directory(struct dir *);
+
+/* unsquash-12.c */
+extern void sort_directory(struct dir_ent **, int);
+
+/* date.c */
+extern int exec_date(char *, unsigned int *);
 #endif

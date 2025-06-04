@@ -66,6 +66,7 @@ struct short_sparse_header {
 struct long_sparse_header {
 	struct sparse_entry	sparse[21];
 	char			isextended;
+	char			pad[7];
 };
 
 
@@ -131,6 +132,13 @@ struct tar_file {
 
 extern void read_tar_file();
 extern squashfs_inode process_tar_file(int progress);
+extern int ignore_zeros;
+extern int default_uid_opt;
+extern unsigned int default_uid;
+extern int default_gid_opt;
+extern unsigned int default_gid;
+extern int default_mode_opt;
+extern mode_t default_mode;
 
 #ifdef XATTR_SUPPORT
 extern int xattr_get_prefix(struct xattr_list *, char *);
