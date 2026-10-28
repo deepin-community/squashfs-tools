@@ -1,0 +1,3 @@
+0001-mksquashfs-use-real-disk-position-in-get_checksum_buffers.patch
+0002-mksquashfs-fix-check-in-duplicate.patch
+0003-mksquashfs-don-t-reset-vpos-if-file-is-a-duplicate.patch

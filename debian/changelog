@@ -1,3 +1,27 @@
+squashfs-tools (1:4.7-0deepin2) stable; urgency=medium
+
+  * Backport upstream mksquashfs duplicate checking fixes
+    - mksquashfs: use real disk position in get_checksum_buffers()
+      Upstream commit 9b3e403128, fixes upstream issue #341
+    - mksquashfs: fix check in duplicate()
+      Upstream commit 45b8cf185f
+    - mksquashfs: don't reset vpos if file is a duplicate
+      Upstream commit a7ccf9f2a9
+    - Fixes files larger than the available buffer space never being
+      detected as duplicates.  This silently stored a second copy of
+      every large duplicated file, which made filesystem-extra.squashfs
+      grow from 3.40 GiB to 4.91 GiB on UOS 25 desktop ISO builds and
+      exceed the 4 GiB ISO 9660 level 2 per-file limit, making the ISO
+      build fail with:
+        libisofs: FAILURE : File "/live/filesystem-extra.squashfs"
+        cannot be added to image because its size is 4 GiB or larger
+    - Verified on the real UOS 25 v25-snipe filesystem-extra tree
+      (110548 files, 17.59 GB uncompressed): deduplicated files go from
+      13793 back to 13796 and the resulting squashfs shrinks from
+      5273083904 to 3654238208 bytes.
+
+ -- lichenggang <lichenggang@uniontech.com>  Wed, 28 Oct 2026 22:30:00 +0800
+
 squashfs-tools (1:4.7-0deepin1) stable; urgency=medium
 
   * New upstream release

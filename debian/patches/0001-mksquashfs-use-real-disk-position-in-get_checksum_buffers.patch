@@ -1,0 +1,58 @@
+From: Phillip Lougher <phillip@squashfs.org.uk>
+Date: Fri, 20 Feb 2026 12:00:00 +0000
+Subject: mksquashfs: use real disk position in get_checksum_buffers()
+Origin: backport, https://github.com/plougher/squashfs-tools/commit/9b3e403128
+Bug: https://github.com/plougher/squashfs-tools/issues/341
+
+If a buffer has been spilled to disk in duplicate checking (because the
+file is larger than the available buffer space), then the buffer has
+to be read back from disk.
+
+With the introduction of virtual disk positions, the code should have
+been updated to map the virtual disk position to the real disk position
+of the block on disk, but it wasn't.
+
+The upshot of this is any file which is larger than the available buffer
+space will not be found to be a duplicate.
+
+In practice mksquashfs then silently stores a second copy of every large
+file that has an identical twin elsewhere in the tree.  On a UOS 25
+desktop ISO build the filesystem-extra.squashfs layer grew from 3.40 GiB
+to 4.91 GiB and could then no longer be added to the ISO at all, because
+ISO 9660 level 2 caps single files at 4 GiB.
+
+Signed-off-by: Phillip Lougher <phillip@squashfs.org.uk>
+
+--- a/squashfs-tools/mksquashfs.c
++++ b/squashfs-tools/mksquashfs.c
+@@ -1961,6 +1961,7 @@ static unsigned short get_checksum_buffers(long long start, long long l,
+ static unsigned short get_checksum_buffers(long long start, long long l,
+ 	unsigned int *blocks, struct file_buffer **buffers)
+ {
++	long long dpos = -1;
+ 	unsigned short chksum = 0;
+ 	unsigned int bytes;
+ 	int i;
+@@ -1972,7 +1973,12 @@ static unsigned short get_checksum_buffers(long long start, long long l,
+ 		if(buffers[i])
+ 			chksum = get_checksum(buffers[i]->data, bytes, chksum);
+ 		else {
+-			void *data = read_from_disk(start, bytes, 0);
++			void *data;
++
++			if(dpos == -1)
++				dpos = get_virt_disk(start);
++
++			data = read_from_disk(dpos, bytes, 0);
+ 			if(data == NULL) {
+ 				ERROR("Failed to checksum data from output"
+ 					" filesystem\n");
+@@ -1984,6 +1990,8 @@ static unsigned short get_checksum_buffers(long long start, long long l,
+ 
+ 		l -= bytes;
+ 		start += bytes;
++		if(dpos != -1)
++			dpos += bytes;
+ 	}
+ 
+ 	return chksum;

@@ -1,0 +1,44 @@
+From: Phillip Lougher <phillip@squashfs.org.uk>
+Date: Fri, 20 Feb 2026 12:20:00 +0000
+Subject: mksquashfs: don't reset vpos if file is a duplicate
+Origin: backport, https://github.com/plougher/squashfs-tools/commit/a7ccf9f2a9
+
+If a file is too big to fit into the available buffer space, before
+duplicate checking buffers will be spilled to disk.
+
+This spilling to disk will create a virtual -> real disk position
+mapping for the spilled blocks.
+
+Now, if the file is found to be duplicate, the buffers written to disk
+will be discarded, but, the virtual -> real disk position mapping won't
+be (it is needed to reset the real disk position).
+
+A subsequent multiblock file will reuse the virtual disk position, with
+the effect that two duplicate virtual -> real disk position mappings
+may be created, with different values.
+
+At this point the failure mode is identical to commit
+767d44ceff8fc8e1e7a47a0bcafdcc40eaeb6503.
+
+After commit 078529915caab11e85299aac1304671151d507a3, Mksquashfs no
+longer waits for all outstanding data blocks to be processed by the
+orderer thread, which means when the lookup takes place in metadata
+creation, there may exist only the first wrong duplicate, which will be
+returned.  Obviously there may exist both duplicate values in which case
+the correct one will be returned.   In other words this is a race.
+
+Signed-off-by: Phillip Lougher <phillip@squashfs.org.uk>
+
+--- a/squashfs-tools/mksquashfs.c
++++ b/squashfs-tools/mksquashfs.c
+@@ -2267,9 +2267,7 @@ static struct file_info *frag_duplicate(struct file_buffer *file_buffer, int *du
+ 
+ static void reset_and_truncate(void)
+ {
+-	int res = reset_vpos();
+-
+-	if(res)
++	if(is_vpos_marked())
+ 		send_orderer_reset(get_marked_vpos());
+ }
+ 

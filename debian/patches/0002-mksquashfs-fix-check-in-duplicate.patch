@@ -1,0 +1,28 @@
+From: Phillip Lougher <phillip@squashfs.org.uk>
+Date: Fri, 20 Feb 2026 12:10:00 +0000
+Subject: mksquashfs: fix check in duplicate()
+Origin: backport, https://github.com/plougher/squashfs-tools/commit/45b8cf185f
+
+Fix check, where value if unused is -1, and not zero.
+
+In practice this *doesn't* cause a bug because if the first block
+doesn't exist dtarget_start will already be used and be greater than
+zero, and if the first block exists then they all will exist, in which
+case dtarget_start will never be used.
+
+Hence the reason why the bug is hidden and has never been triggered.
+But it should be fixed.
+
+Signed-off-by: Phillip Lougher <phillip@squashfs.org.uk>
+
+--- a/squashfs-tools/mksquashfs.c
++++ b/squashfs-tools/mksquashfs.c
+@@ -2388,7 +2388,7 @@ static struct file_info *duplicate(int *dupf, int *block_dup,
+ 					break;
+ 				target_start += size;
+ 				dup_start += size;
+-				if(dtarget_start)
++				if(dtarget_start != -1)
+ 					dtarget_start += size;
+ 				if(ddup_start != -1)
+ 					ddup_start += size;
